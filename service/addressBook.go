@@ -121,9 +121,39 @@ func (s *AddressBookService) FromPeer(peer *model.Peer) (a *model.AddressBook) {
 	a.Id = peer.Id
 	a.Username = peer.Username
 	a.Hostname = peer.Hostname
+	a.Alias = peer.Alias
 	a.UserId = peer.UserId
 	a.Platform = s.PlatformFromOs(peer.Os)
 	return a
+}
+
+// FindPeersByRowIds loads peers by their integer primary keys in a single query.
+func (s *AddressBookService) FindPeersByRowIds(ids []uint) []*model.Peer {
+	var peers []*model.Peer
+	DB.Where("row_id in ?", ids).Find(&peers)
+	return peers
+}
+
+// CreateBatch inserts multiple address book entries inside a single DB transaction.
+// On any write error the transaction is rolled back and an error is returned;
+// no partial inserts are committed.
+func (s *AddressBookService) CreateBatch(abs []*model.AddressBook) error {
+	tx := DB.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	for _, ab := range abs {
+		if err := tx.Create(ab).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit().Error
+}
+
+// CreateBatchAudit persists a single audit record for a batch operation.
+func (s *AddressBookService) CreateBatchAudit(a *model.AuditAbBatch) error {
+	return DB.Create(a).Error
 }
 
 // Create 创建

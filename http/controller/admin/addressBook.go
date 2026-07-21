@@ -7,6 +7,7 @@ import (
 	"github.com/lejianwen/rustdesk-api/v2/global"
 	"github.com/lejianwen/rustdesk-api/v2/http/request/admin"
 	"github.com/lejianwen/rustdesk-api/v2/http/response"
+	"github.com/lejianwen/rustdesk-api/v2/model"
 	"github.com/lejianwen/rustdesk-api/v2/service"
 	"gorm.io/gorm"
 	"strconv"
@@ -329,34 +330,96 @@ func (ct *AddressBook) BatchCreateFromPeers(c *gin.Context) {
 		return
 	}
 
+	// Ownership check: collection must belong to the target user_id.
+	// CheckCollectionOwner returns false both when collection doesn't exist
+	// and when it exists but belongs to a different user — intentionally opaque.
 	if f.CollectionId != 0 {
-		collection := service.AllService.AddressBookService.CollectionInfoById(f.CollectionId)
-		if collection.Id == 0 {
-			response.Fail(c, 101, response.TranslateMsg(c, "ItemNotFound"))
+		if !service.AllService.AddressBookService.CheckCollectionOwner(f.UserId, f.CollectionId) {
+			response.Fail(c, 101, response.TranslateMsg(c, "NoAccess"))
 			return
 		}
 	}
 
-	pl := int64(len(f.PeerIds))
-	peers := service.AllService.PeerService.List(1, uint(pl), func(tx *gorm.DB) {
-		tx.Where("row_id in ?", f.PeerIds)
-	})
-	if peers.Total == 0 || pl != peers.Total {
-		response.Fail(c, 101, response.TranslateMsg(c, "ItemNotFound"))
+	if len(f.PeerIds) == 0 {
+		response.Fail(c, 101, response.TranslateMsg(c, "ParamsError"))
 		return
 	}
 
 	tags, _ := json.Marshal(f.Tags)
-	for _, peer := range peers.Peers {
+
+	// Phase 1 — Classification (read-only, no DB writes).
+	peers := service.AllService.AddressBookService.FindPeersByRowIds(f.PeerIds)
+	peerMap := make(map[uint]*model.Peer, len(peers))
+	for _, p := range peers {
+		peerMap[p.RowId] = p
+	}
+
+	type PeerResult struct {
+		PeerId uint   `json:"peer_id"`
+		Status string `json:"status"` // added | existing | not_found | failed
+	}
+	results := make([]PeerResult, 0, len(f.PeerIds))
+	pendingABs := make([]*model.AddressBook, 0)
+	pendingIdxs := make([]int, 0)
+	notFoundCount, existingCount := 0, 0
+
+	for _, pid := range f.PeerIds {
+		peer, ok := peerMap[pid]
+		if !ok {
+			results = append(results, PeerResult{PeerId: pid, Status: "not_found"})
+			notFoundCount++
+			continue
+		}
 		ab := service.AllService.AddressBookService.FromPeer(peer)
 		ab.Tags = tags
 		ab.CollectionId = f.CollectionId
 		ab.UserId = f.UserId
 		ex := service.AllService.AddressBookService.InfoByUserIdAndIdAndCid(f.UserId, ab.Id, ab.CollectionId)
 		if ex.RowId != 0 {
+			results = append(results, PeerResult{PeerId: pid, Status: "existing"})
+			existingCount++
 			continue
 		}
-		service.AllService.AddressBookService.Create(ab)
+		pendingIdxs = append(pendingIdxs, len(results))
+		results = append(results, PeerResult{PeerId: pid, Status: "pending"})
+		pendingABs = append(pendingABs, ab)
 	}
-	response.Success(c, nil)
+
+	// Phase 2 — Transactional writes (all-or-nothing for the pending set).
+	addedCount, failedCount := 0, 0
+	if len(pendingABs) > 0 {
+		if err := service.AllService.AddressBookService.CreateBatch(pendingABs); err != nil {
+			failedCount = len(pendingABs)
+			for _, idx := range pendingIdxs {
+				results[idx].Status = "failed"
+			}
+		} else {
+			addedCount = len(pendingABs)
+			for _, idx := range pendingIdxs {
+				results[idx].Status = "added"
+			}
+		}
+	}
+
+	// Phase 3 — Audit (best-effort; never blocks the response).
+	adminUser := service.AllService.UserService.CurUser(c)
+	_ = service.AllService.AddressBookService.CreateBatchAudit(&model.AuditAbBatch{
+		AdminId:      adminUser.Id,
+		UserId:       f.UserId,
+		CollectionId: f.CollectionId,
+		Total:        len(f.PeerIds),
+		Added:        addedCount,
+		Existing:     existingCount,
+		NotFound:     notFoundCount,
+		Failed:       failedCount,
+	})
+
+	response.Success(c, gin.H{
+		"total":     len(f.PeerIds),
+		"added":     addedCount,
+		"existing":  existingCount,
+		"not_found": notFoundCount,
+		"failed":    failedCount,
+		"results":   results,
+	})
 }

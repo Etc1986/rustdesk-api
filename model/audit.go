@@ -44,3 +44,18 @@ type AuditFileList struct {
 	AuditFiles []*AuditFile `json:"list"`
 	Pagination
 }
+
+// AuditAbBatch records one administrative "batch-add-to-address-book" operation.
+// One row per invocation of BatchCreateFromPeers; counters summarise the outcome.
+type AuditAbBatch struct {
+	IdModel
+	AdminId      uint `json:"admin_id" gorm:"default:0;not null;index"`
+	UserId       uint `json:"user_id" gorm:"default:0;not null;index"`
+	CollectionId uint `json:"collection_id" gorm:"default:0;not null"`
+	Total        int  `json:"total" gorm:"default:0;not null"`
+	Added        int  `json:"added" gorm:"default:0;not null"`
+	Existing     int  `json:"existing" gorm:"default:0;not null"`
+	NotFound     int  `json:"not_found" gorm:"default:0;not null"`
+	Failed       int  `json:"failed" gorm:"default:0;not null"`
+	TimeModel
+}
