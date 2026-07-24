@@ -175,31 +175,74 @@ func TestEvaluate_NoMatch(t *testing.T) {
 // Ambiguity detection: overlap decision + FindConflict / FindDuplicate
 // ─────────────────────────────────────────────────────────────────────────────
 
-func TestMatchersCanOverlap(t *testing.T) {
+func TestPatternsCanOverlapForCollision(t *testing.T) {
 	P, S, C, E := model.MatcherTypePrefix, model.MatcherTypeSuffix, model.MatcherTypeContains, model.MatcherTypeExact
 	cases := []struct {
 		at, ap, bt, bp string
 		want           bool
 	}{
-		{C, "suc47", P, "svr-", true},        // svr-suc47
-		{P, "svr-", S, "-c", true},           // svr-...-c
-		{P, "svr-", P, "svr-suc", true},      // one prefix of the other
-		{P, "svr-", P, "wks-", false},        // disjoint prefixes
-		{S, "-c", S, "x-c", true},            // "-c" is a suffix of "x-c" → some host ends in both
-		{S, "-c", S, "-abc", false},          // NOT overlapping: host ending "-abc" ends in "bc", not "-c"
-		{S, "-c", S, "-s", false},            // disjoint suffixes
+		// Mixed anchors: a single real hostname can satisfy both → real collision.
+		{C, "suc47", P, "svr-", true}, // svr-suc47
+		{P, "svr-", S, "-c", true},    // svr-...-c
+		// Same-type prefix: collide iff one is a prefix of the other.
+		{P, "svr-", P, "svr-suc", true},  // one prefix of the other
+		{P, "svr-", P, "wks-", false},    // disjoint prefixes
+		// Same-type suffix: collide iff one is a suffix of the other.
+		{S, "-c", S, "x-c", true},   // "-c" is a suffix of "x-c"
+		{S, "-c", S, "-abc", false}, // "-abc" does not end in "-c"
+		{S, "-c", S, "-s", false},   // disjoint suffixes
+		// Exact pairings.
 		{E, "svr-suc47", P, "svr-", true},    // exact satisfies prefix
 		{E, "svr-suc47", P, "wks-", false},   // exact fails prefix
 		{E, "svr-suc47", C, "suc47", true},   // exact contains token
 		{E, "svr-suc470", C, "suc47", false}, // exact does NOT contain token suc47
-		{E, "a", E, "a", true},               // identical exacts
-		{E, "a", E, "b", false},              // different exacts
-		{C, "a", C, "b", true},               // contains+contains always constructible
+		{E, "a", E, "a", true},               // identical exacts collide
+		{E, "a", E, "b", false},              // different exacts do not
+		// Same-type contains: collide iff one is a substring of the other.
+		{C, "suc", C, "suc01", true},    // substring → real collision (broad vs specific)
+		{C, "suc01", C, "suc", true},    // symmetric
+		{C, "suc01", C, "suc02", false}, // disjoint branch tokens → NO collision (the bug)
+		{C, "a", C, "b", false},         // disjoint contains → NO collision
+		{C, "suc01", C, "suc01", true},  // identical contains collide
 	}
 	for _, c := range cases {
-		if got := MatchersCanOverlap(c.at, c.ap, c.bt, c.bp); got != c.want {
-			t.Errorf("overlap(%s:%q, %s:%q) = %v, want %v", c.at, c.ap, c.bt, c.bp, got, c.want)
+		if got := patternsCanOverlapForCollision(c.at, c.ap, c.bt, c.bp); got != c.want {
+			t.Errorf("collision(%s:%q, %s:%q) = %v, want %v", c.at, c.ap, c.bt, c.bp, got, c.want)
 		}
+	}
+}
+
+// TestFindConflict_DisjointBranchTokens is the end-to-end regression for the
+// reported bug: 54 disjoint branch rules (contains sucNN) at the same priority
+// must not conflict with each other, while a broad "suc" rule at that priority
+// DOES conflict (it is a substring of every branch token).
+func TestFindConflict_DisjointBranchTokens(t *testing.T) {
+	setupPCTestDB(t)
+	svc := &PeerClassificationService{}
+
+	// Seed suc01..suc54, each routing to its own collection, all priority 50.
+	for n := 1; n <= 54; n++ {
+		r := &model.PeerClassificationRule{
+			UserId: 1, MatcherType: model.MatcherTypeContains,
+			Pattern: fmt.Sprintf("suc%02d", n), TargetCollectionId: uptr(uint(100 + n)),
+			TargetTags: EncodeTags(nil), Priority: 50, Active: true,
+		}
+		if c := svc.FindConflict(r); c != nil {
+			t.Fatalf("suc%02d should not conflict with any prior branch rule, got rule id=%d (pattern %q)", n, c.Id, c.Pattern)
+		}
+		if err := svc.CreateRule(r); err != nil {
+			t.Fatalf("create suc%02d: %v", n, err)
+		}
+	}
+
+	// A broad "suc" rule at the same priority, different collection, DOES conflict
+	// (it is a substring of every branch token → real ambiguity).
+	broad := &model.PeerClassificationRule{
+		UserId: 1, MatcherType: model.MatcherTypeContains, Pattern: "suc",
+		TargetCollectionId: uptr(999), Priority: 50, Active: true,
+	}
+	if c := svc.FindConflict(broad); c == nil {
+		t.Error("broad 'suc' rule must conflict with the branch rules (substring collision)")
 	}
 }
 
@@ -576,5 +619,46 @@ func TestApply_PurgesPreviousSnapshotDetail(t *testing.T) {
 	DB.Model(&model.AuditPeerClassificationItem{}).Count(&totalItems)
 	if totalItems != 1 {
 		t.Errorf("only the latest run's detail should remain, got %d total items", totalItems)
+	}
+}
+
+// TestFindConflict_ExactAndCrossPriority pins two must-not-loosen behaviours:
+// identical exact rules at the same priority DO conflict, and a mixed
+// prefix/contains pair at DIFFERENT priorities does NOT (priority disambiguates,
+// the svr-suc47 scenario).
+func TestFindConflict_ExactAndCrossPriority(t *testing.T) {
+	setupPCTestDB(t)
+	svc := &PeerClassificationService{}
+
+	// Two identical exact rules, same priority, different collections → conflict.
+	e1 := &model.PeerClassificationRule{
+		UserId: 1, MatcherType: model.MatcherTypeExact, Pattern: "svr-suc01",
+		TargetCollectionId: uptr(10), TargetTags: EncodeTags(nil), Priority: 50, Active: true,
+	}
+	if err := svc.CreateRule(e1); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	e2 := &model.PeerClassificationRule{
+		UserId: 1, MatcherType: model.MatcherTypeExact, Pattern: "svr-suc01",
+		TargetCollectionId: uptr(11), Priority: 50, Active: true,
+	}
+	if svc.FindConflict(e2) == nil {
+		t.Error("identical exact rules at same priority must conflict")
+	}
+
+	// prefix svr- and contains suc01 at DIFFERENT priorities → no conflict.
+	pfx := &model.PeerClassificationRule{
+		UserId: 1, MatcherType: model.MatcherTypePrefix, Pattern: "svr-",
+		TargetCollectionId: uptr(20), TargetTags: EncodeTags(nil), Priority: 10, Active: true,
+	}
+	if err := svc.CreateRule(pfx); err != nil {
+		t.Fatalf("seed prefix: %v", err)
+	}
+	ctn := &model.PeerClassificationRule{
+		UserId: 1, MatcherType: model.MatcherTypeContains, Pattern: "suc01",
+		TargetCollectionId: uptr(21), Priority: 100, Active: true, // different priority
+	}
+	if c := svc.FindConflict(ctn); c != nil {
+		t.Errorf("different priorities must not conflict, got rule id=%d", c.Id)
 	}
 }

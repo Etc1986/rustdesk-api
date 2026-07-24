@@ -163,18 +163,40 @@ func EncodeTags(tags []string) custom_types.AutoJson {
 
 // ───────────────────────────── Ambiguity ─────────────────────────────
 
-// MatchersCanOverlap reports whether some hypothetical hostname could match
-// BOTH matchers. For the four supported matcher types this decision is exact
-// (not a heuristic): the string space is unbounded, but overlap for these forms
-// is fully decidable structurally. See BUILD_LOG 2026-07-23 for the case proof.
-func MatchersCanOverlap(aType, aPattern, bType, bPattern string) bool {
+// patternsCanOverlapForCollision reports whether two SAME-priority collection
+// rules should be treated as colliding — i.e. whether they could plausibly route
+// the same real device to two different collections.
+//
+// This is deliberately NOT the literal "could any hypothetical hostname match
+// both" question. Under token semantics almost any two `contains` tokens can be
+// forced to co-occur in a synthetic hostname (e.g. "svr-suc01-suc02"), so the
+// literal answer for contains-vs-contains is always yes. But disjoint branch
+// tokens like "suc01" and "suc02" never target the same real device, so flagging
+// them as a conflict is a false positive that blocks a legitimate setup (54
+// branches suc01..suc54 sharing one priority). The collision criterion is
+// therefore substring-based:
+//
+//	exact    vs exact    → collide iff identical
+//	prefix   vs prefix   → collide iff one is a prefix of the other
+//	suffix   vs suffix   → collide iff one is a suffix of the other
+//	contains vs contains → collide iff one is a substring of the other
+//	any pair with exact  → collide iff the exact literal satisfies the other matcher
+//	mixed anchors        → collide (prefix/suffix, prefix/contains, suffix/contains
+//	                        can all be satisfied by one real hostname, e.g. prefix
+//	                        "svr-" and contains "suc01" both match "svr-suc01")
+//
+// Substring/prefix/suffix pairs are genuine collisions: if A is a substring of B
+// then every device the more specific rule catches is also caught by the broader
+// one, so with equal priority the target collection is ambiguous.
+func patternsCanOverlapForCollision(aType, aPattern, bType, bPattern string) bool {
 	ap := strings.ToLower(aPattern)
 	bp := strings.ToLower(bPattern)
 	if ap == "" || bp == "" {
 		return false
 	}
 
-	// Exact literals: overlap iff the literal itself satisfies the other matcher.
+	// Any pair involving an exact matcher: collide iff the exact literal itself
+	// satisfies the other matcher (this yields exact-vs-exact = identical).
 	if aType == model.MatcherTypeExact && bType == model.MatcherTypeExact {
 		return ap == bp
 	}
@@ -185,16 +207,19 @@ func MatchersCanOverlap(aType, aPattern, bType, bPattern string) bool {
 		return MatcherMatches(aType, ap, bp)
 	}
 
-	// Neither is exact. Two same-direction anchors overlap only if one pattern
-	// is a prefix/suffix of the other; every other combination among
-	// {prefix, suffix, contains} is always constructible (e.g. prefix+suffix via
-	// ap+bp; anything with contains by inserting the token between separators).
+	// Same-type anchors collide only when one pattern contains the other in the
+	// relevant position. Disjoint patterns (neither contained in the other) do
+	// not collide.
 	switch {
 	case aType == model.MatcherTypePrefix && bType == model.MatcherTypePrefix:
 		return strings.HasPrefix(ap, bp) || strings.HasPrefix(bp, ap)
 	case aType == model.MatcherTypeSuffix && bType == model.MatcherTypeSuffix:
 		return strings.HasSuffix(ap, bp) || strings.HasSuffix(bp, ap)
+	case aType == model.MatcherTypeContains && bType == model.MatcherTypeContains:
+		return strings.Contains(ap, bp) || strings.Contains(bp, ap)
 	default:
+		// Mixed anchors: a single real hostname can satisfy both, so keep
+		// treating them as a real overlap.
 		return true
 	}
 }
@@ -281,7 +306,7 @@ func (s *PeerClassificationService) FindConflict(r *model.PeerClassificationRule
 		if o.TargetCollectionId == nil || *o.TargetCollectionId == *r.TargetCollectionId {
 			continue
 		}
-		if MatchersCanOverlap(r.MatcherType, r.Pattern, o.MatcherType, o.Pattern) {
+		if patternsCanOverlapForCollision(r.MatcherType, r.Pattern, o.MatcherType, o.Pattern) {
 			return o
 		}
 	}
