@@ -143,7 +143,7 @@ func firstResult(resp map[string]interface{}) map[string]interface{} {
 func TestSimulateApply_NoMatchLeavesPeerIntact(t *testing.T) {
 	db := setupPCHandlerDB(t)
 	seedRule(db, 1, model.MatcherTypeContains, "suc47", 47, 10)
-	db.Create(&model.Peer{Id: "wks-x", Hostname: "wks-plain", UserId: 1, Os: "Windows"})
+	db.Create(&model.Peer{Id: "wks-x", Hostname: "wks-plain", UserId: 0, Os: "Windows"})
 
 	router := pcRouter(makeUser(1))
 
@@ -172,8 +172,8 @@ func TestSimulateApply_NoMatchLeavesPeerIntact(t *testing.T) {
 func TestSimulate_DoesNotWrite(t *testing.T) {
 	db := setupPCHandlerDB(t)
 	seedRule(db, 1, model.MatcherTypePrefix, "svr-", 5, 10)
-	db.Create(&model.Peer{Id: "svr-1", Hostname: "svr-1", UserId: 1, Os: "Windows"})
-	db.Create(&model.Peer{Id: "svr-2", Hostname: "svr-2", UserId: 1, Os: "Windows"})
+	db.Create(&model.Peer{Id: "svr-1", Hostname: "svr-1", UserId: 0, Os: "Windows"})
+	db.Create(&model.Peer{Id: "svr-2", Hostname: "svr-2", UserId: 0, Os: "Windows"})
 
 	before := abCount(db)
 	var ruleBefore, auditBefore int64
@@ -212,7 +212,7 @@ func TestApply_MovesExistingEntryNoDuplicate(t *testing.T) {
 
 	// Peer already in AB in collection 3 (placed earlier). Its hostname now
 	// reads svr-suc47 (changed), which a rule routes to collection 47.
-	db.Create(&model.Peer{Id: "dev-1", Hostname: "svr-suc47", UserId: 1, Os: "Windows", Username: "op"})
+	db.Create(&model.Peer{Id: "dev-1", Hostname: "svr-suc47", UserId: 0, Os: "Windows", Username: "op"})
 	db.Create(&model.AddressBook{
 		Id: "dev-1", UserId: 1, CollectionId: 3,
 		Hostname: "OLD-NAME", Alias: "manual-alias", Tags: service.EncodeTags([]string{"keep"}),
@@ -261,7 +261,7 @@ func TestPinned_SimulateReportsAndApplyProtects(t *testing.T) {
 	db := setupPCHandlerDB(t)
 
 	// Peer whose live hostname a rule would route to collection 47 with a tag.
-	db.Create(&model.Peer{Id: "dev-1", Hostname: "svr-suc47", UserId: 1, Os: "Windows", Username: "op"})
+	db.Create(&model.Peer{Id: "dev-1", Hostname: "svr-suc47", UserId: 0, Os: "Windows", Username: "op"})
 	// Existing AB entry, PINNED, in collection 3 with a manual alias + tag.
 	db.Create(&model.AddressBook{
 		Id: "dev-1", UserId: 1, CollectionId: 3, Pinned: true,
@@ -327,7 +327,7 @@ func TestPinned_SimulateReportsAndApplyProtects(t *testing.T) {
 // classification (no regression path).
 func TestPinned_NonPinnedUnaffected(t *testing.T) {
 	db := setupPCHandlerDB(t)
-	db.Create(&model.Peer{Id: "dev-2", Hostname: "svr-suc47", UserId: 1, Os: "Windows"})
+	db.Create(&model.Peer{Id: "dev-2", Hostname: "svr-suc47", UserId: 0, Os: "Windows"})
 	db.Create(&model.AddressBook{
 		Id: "dev-2", UserId: 1, CollectionId: 3, Pinned: false,
 		Alias: "manual", Tags: service.EncodeTags([]string{"keep"}),
@@ -412,38 +412,90 @@ func TestPin_ToggleAndScope(t *testing.T) {
 // Test point 7: multi-tenant isolation — user A's rules don't touch user B's peers
 // ─────────────────────────────────────────────────────────────────────────────
 
+// TestApply_MultiTenantIsolation verifies the CORRECT multi-tenant model: the
+// engine evaluates ALL peers (peers are global, user_id is not device ownership
+// in Lejianwen), but isolation comes from (a) rules being per-user and (b) the
+// address_book entries being owned by the running user.
 func TestApply_MultiTenantIsolation(t *testing.T) {
 	db := setupPCHandlerDB(t)
 
-	// Only user 1 owns a rule. Both users own a matching-looking peer.
+	// Two global peers (user_id = 0, the real Lejianwen case). Only user 1 has a
+	// rule; user 2 has none.
 	seedRule(db, 1, model.MatcherTypePrefix, "svr-", 5, 10)
-	db.Create(&model.Peer{Id: "svr-u1", Hostname: "svr-u1", UserId: 1, Os: "Windows"})
-	db.Create(&model.Peer{Id: "svr-u2", Hostname: "svr-u2", UserId: 2, Os: "Windows"})
+	db.Create(&model.Peer{Id: "svr-a", Hostname: "svr-a", UserId: 0, Os: "Windows"})
+	db.Create(&model.Peer{Id: "svr-b", Hostname: "svr-b", UserId: 0, Os: "Windows"})
 
-	// Apply as user 2: no rules for user 2 → their peer untouched.
+	// Apply as user 2 (no rules): every peer is evaluated, but nothing matches →
+	// nothing is created. Rules are what's scoped, not the peer set.
 	resp := pcPost(t, pcRouter(makeUser(2)), "/apply")
 	if respCode(resp) != 0 {
 		t.Fatalf("apply(user2) failed: %v", resp)
 	}
-	if dataInt(resp, "total") != 1 || dataInt(resp, "no_match") != 1 || dataInt(resp, "created") != 0 {
-		t.Errorf("user2 should see only their 1 peer, no match: got %v", resp["data"])
+	if dataInt(resp, "total") != 2 || dataInt(resp, "no_match") != 2 || dataInt(resp, "created") != 0 {
+		t.Errorf("user2 (no rules) should evaluate 2 peers, match none: got %v", resp["data"])
 	}
 	if abCount(db) != 0 {
 		t.Errorf("user2 apply must not create anything; AB rows=%d", abCount(db))
 	}
 
-	// Apply as user 1: only their peer is evaluated and created.
+	// Apply as user 1: all peers evaluated against user 1's rule → both created,
+	// owned by user 1 (not by the peers' user_id=0).
 	resp = pcPost(t, pcRouter(makeUser(1)), "/apply")
 	if respCode(resp) != 0 {
 		t.Fatalf("apply(user1) failed: %v", resp)
 	}
-	if dataInt(resp, "total") != 1 || dataInt(resp, "created") != 1 {
-		t.Errorf("user1 should create their 1 peer: got %v", resp["data"])
+	if dataInt(resp, "total") != 2 || dataInt(resp, "created") != 2 {
+		t.Errorf("user1 should create both peers: got %v", resp["data"])
 	}
-	// The only AB row belongs to user 1's peer.
 	var rows []model.AddressBook
 	db.Find(&rows)
-	if len(rows) != 1 || rows[0].Id != "svr-u1" || rows[0].UserId != 1 {
-		t.Errorf("cross-tenant leak: AB rows=%+v", rows)
+	if len(rows) != 2 {
+		t.Fatalf("want 2 AB rows, got %d", len(rows))
+	}
+	for _, r := range rows {
+		if r.UserId != 1 || r.CollectionId != 5 {
+			t.Errorf("entry must be owned by running user 1 in collection 5, got user=%d col=%d", r.UserId, r.CollectionId)
+		}
+	}
+}
+
+// TestSimulateApply_EvaluatesPeersWithUserIdZero is the regression test for the
+// lab bug: peers with user_id = 0 (every peer in Lejianwen, including real
+// devices) must be evaluated by simulate and apply. Before the fix the engine
+// filtered peers by user_id and returned Total 0.
+func TestSimulateApply_EvaluatesPeersWithUserIdZero(t *testing.T) {
+	db := setupPCHandlerDB(t)
+
+	// The realistic lab shape: admin is user 1, peers all have user_id = 0.
+	seedRule(db, 1, model.MatcherTypeContains, "suc47", 47, 10)
+	db.Create(&model.Peer{Id: "real-1", Hostname: "svr-suc47", UserId: 0, Os: "Windows", Username: "op"})
+	db.Create(&model.Peer{Id: "real-2", Hostname: "wks-plain", UserId: 0, Os: "Windows"})
+
+	router := pcRouter(makeUser(1))
+
+	// Simulate must SEE the peers (Total 2, not 0).
+	resp := pcPost(t, router, "/simulate")
+	if respCode(resp) != 0 {
+		t.Fatalf("simulate failed: %v", resp)
+	}
+	if dataInt(resp, "total") != 2 {
+		t.Fatalf("regression: simulate must evaluate user_id=0 peers, got total=%d", dataInt(resp, "total"))
+	}
+	if dataInt(resp, "created") != 1 || dataInt(resp, "no_match") != 1 {
+		t.Errorf("want created=1 no_match=1, got %v", resp["data"])
+	}
+
+	// Apply must classify the matching user_id=0 peer into user 1's address book.
+	resp = pcPost(t, router, "/apply")
+	if respCode(resp) != 0 {
+		t.Fatalf("apply failed: %v", resp)
+	}
+	if dataInt(resp, "total") != 2 || dataInt(resp, "created") != 1 {
+		t.Errorf("apply want total=2 created=1, got %v", resp["data"])
+	}
+	var ab model.AddressBook
+	db.Where("id = ?", "real-1").First(&ab)
+	if ab.UserId != 1 || ab.CollectionId != 47 || ab.Alias != "svr-suc47" {
+		t.Errorf("user_id=0 peer not classified into user 1's book: %+v", ab)
 	}
 }

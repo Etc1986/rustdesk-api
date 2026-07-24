@@ -301,7 +301,7 @@ func TestApply_RollbackOnMidBatchFailure(t *testing.T) {
 	}
 	// Three peers, all matching → all "create".
 	for i := 0; i < 3; i++ {
-		DB.Create(&model.Peer{Id: fmt.Sprintf("svr-%d", i), Hostname: fmt.Sprintf("svr-%d", i), UserId: 1, Os: "Windows"})
+		DB.Create(&model.Peer{Id: fmt.Sprintf("svr-%d", i), Hostname: fmt.Sprintf("svr-%d", i), UserId: 0, Os: "Windows"})
 	}
 
 	// Inject a fault on the 2nd write to force a mid-batch failure.
@@ -346,8 +346,8 @@ func TestApply_HappyPathAudit(t *testing.T) {
 	if err := svc.CreateRule(rule); err != nil {
 		t.Fatalf("seed rule: %v", err)
 	}
-	DB.Create(&model.Peer{Id: "svr-a", Hostname: "svr-a", UserId: 1, Os: "Windows", Username: "adm"})
-	DB.Create(&model.Peer{Id: "wks-b", Hostname: "wks-b", UserId: 1, Os: "Windows"}) // no match
+	DB.Create(&model.Peer{Id: "svr-a", Hostname: "svr-a", UserId: 0, Os: "Windows", Username: "adm"})
+	DB.Create(&model.Peer{Id: "wks-b", Hostname: "wks-b", UserId: 0, Os: "Windows"}) // no match
 
 	_, summary, err := svc.Apply(1, 1)
 	if err != nil {

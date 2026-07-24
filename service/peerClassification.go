@@ -361,8 +361,14 @@ func unionTags(current, add []string) []string {
 func (s *PeerClassificationService) BuildPlan(userId uint) ([]PeerClassificationResult, PlanSummary) {
 	rules := s.ActiveRulesByUserId(userId)
 
+	// Evaluate ALL peers, not a user_id-scoped subset. In Lejianwen peers.user_id
+	// is 0 for every peer (including real production devices reported by the
+	// RustDesk client) — the column exists but is not used to assign device
+	// ownership. Filtering by it made /simulate return Total 0 against the real
+	// lab DB. userId still scopes the RULES (above) and the address_books entries
+	// that get created/updated (currentABEntry / the writer), where it IS real.
 	var peers []*model.Peer
-	DB.Where("user_id = ?", userId).Order("row_id asc").Find(&peers)
+	DB.Order("row_id asc").Find(&peers)
 
 	results := make([]PeerClassificationResult, 0, len(peers))
 	summary := PlanSummary{Total: len(peers)}
@@ -473,8 +479,9 @@ func (s *PeerClassificationService) Apply(userId, adminId uint) ([]PeerClassific
 	results, summary := s.BuildPlan(userId)
 
 	// Index peers by rustdesk id for the writer (need Username/Os on create).
+	// Same as BuildPlan: evaluate ALL peers (peers.user_id is 0 in Lejianwen).
 	var peers []*model.Peer
-	DB.Where("user_id = ?", userId).Find(&peers)
+	DB.Find(&peers)
 	peerById := make(map[string]*model.Peer, len(peers))
 	for _, p := range peers {
 		peerById[p.Id] = p
