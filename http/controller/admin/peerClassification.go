@@ -146,6 +146,38 @@ func (ct *PeerClassificationRule) Delete(c *gin.Context) {
 	response.Success(c, nil)
 }
 
+// Pin sets or clears the pinned flag on an address-book entry. A user may pin
+// their own entries; pinning another user's entry requires admin privilege.
+// @Router /admin/peer_classification/pin [post]
+func (ct *PeerClassificationRule) Pin(c *gin.Context) {
+	f := &admin.PinForm{}
+	if err := c.ShouldBindJSON(f); err != nil {
+		response.Fail(c, 101, response.TranslateMsg(c, "ParamsError")+err.Error())
+		return
+	}
+	if errList := global.Validator.ValidStruct(c, f); len(errList) > 0 {
+		response.Fail(c, 101, errList[0])
+		return
+	}
+	u := service.AllService.UserService.CurUser(c)
+	ab := service.AllService.AddressBookService.InfoByRowId(f.RowId)
+	if ab.RowId == 0 {
+		response.Fail(c, 101, response.TranslateMsg(c, "ItemNotFound"))
+		return
+	}
+	// Scope: own entry, or an admin acting on someone else's.
+	isAdmin := u != nil && u.IsAdmin != nil && *u.IsAdmin
+	if ab.UserId != u.Id && !isAdmin {
+		response.Fail(c, 101, response.TranslateMsg(c, "NoAccess"))
+		return
+	}
+	if err := service.AllService.PeerClassificationService.SetPinned(f.RowId, f.Pinned); err != nil {
+		response.Fail(c, 101, response.TranslateMsg(c, "OperationFailed")+err.Error())
+		return
+	}
+	response.Success(c, nil)
+}
+
 // Simulate computes the full classification plan for the current user's peers
 // WITHOUT writing anything (dry-run). Re-evaluates every peer, including those
 // already in the address book.
@@ -171,13 +203,14 @@ func (ct *PeerClassificationRule) Apply(c *gin.Context) {
 
 func classificationPayload(applied bool, s service.PlanSummary, results []service.PeerClassificationResult) gin.H {
 	return gin.H{
-		"applied":   applied,
-		"total":     s.Total,
-		"created":   s.Created,
-		"moved":     s.Moved,
-		"updated":   s.Updated,
-		"unchanged": s.Unchanged,
-		"no_match":  s.NoMatch,
-		"results":   results,
+		"applied":        applied,
+		"total":          s.Total,
+		"created":        s.Created,
+		"moved":          s.Moved,
+		"updated":        s.Updated,
+		"unchanged":      s.Unchanged,
+		"no_match":       s.NoMatch,
+		"pinned_skipped": s.PinnedSkipped,
+		"results":        results,
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/lejianwen/rustdesk-api/v2/global"
 	"github.com/lejianwen/rustdesk-api/v2/model"
 	"github.com/lejianwen/rustdesk-api/v2/service"
 	"gorm.io/driver/sqlite"
@@ -42,10 +43,11 @@ func setupPCHandlerDB(t *testing.T) *gorm.DB {
 		UserService:               &service.UserService{},
 		PeerClassificationService: &service.PeerClassificationService{},
 	}
+	global.ApiInitValidator() // Pin handler uses global.Validator.ValidStruct
 	return db
 }
 
-// pcRouter registers the simulate/apply routes with an injected current user.
+// pcRouter registers the classification routes with an injected current user.
 func pcRouter(curUser *model.User) *gin.Engine {
 	r := gin.New()
 	ct := &PeerClassificationRule{}
@@ -59,7 +61,31 @@ func pcRouter(curUser *model.User) *gin.Engine {
 	}
 	r.POST("/simulate", inject(ct.Simulate))
 	r.POST("/apply", inject(ct.Apply))
+	r.POST("/pin", inject(ct.Pin))
 	return r
+}
+
+// makeAdmin returns a *model.User with Id set and IsAdmin=true.
+func makeAdmin(id uint) *model.User {
+	u := makeUser(id)
+	yes := true
+	u.IsAdmin = &yes
+	return u
+}
+
+// pcPostBody posts a JSON body to path and decodes the response.
+func pcPostBody(t *testing.T, router *gin.Engine, path string, body interface{}) map[string]interface{} {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal %q: %v", w.Body.String(), err)
+	}
+	return resp
 }
 
 func pcPost(t *testing.T, router *gin.Engine, path string) map[string]interface{} {
@@ -84,10 +110,30 @@ func seedRule(db *gorm.DB, userId uint, mtype, pattern string, col uint, priorit
 	})
 }
 
+func seedRuleTags(db *gorm.DB, userId uint, mtype, pattern string, col uint, tags []string, priority int) {
+	col2 := col
+	db.Create(&model.PeerClassificationRule{
+		UserId: userId, MatcherType: mtype, Pattern: pattern,
+		TargetCollectionId: &col2, TargetTags: service.EncodeTags(tags),
+		Priority: priority, Active: true,
+	})
+}
+
 func abCount(db *gorm.DB) int64 {
 	var n int64
 	db.Model(&model.AddressBook{}).Count(&n)
 	return n
+}
+
+// firstResult returns the first row of the response's results array.
+func firstResult(resp map[string]interface{}) map[string]interface{} {
+	data, _ := resp["data"].(map[string]interface{})
+	results, _ := data["results"].([]interface{})
+	if len(results) == 0 {
+		return map[string]interface{}{}
+	}
+	row, _ := results[0].(map[string]interface{})
+	return row
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,6 +250,161 @@ func TestApply_MovesExistingEntryNoDuplicate(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("manual tag 'keep' must be preserved by union, got %v", tags)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pinned: a pinned entry is fully protected — collection, alias and tags
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestPinned_SimulateReportsAndApplyProtects(t *testing.T) {
+	db := setupPCHandlerDB(t)
+
+	// Peer whose live hostname a rule would route to collection 47 with a tag.
+	db.Create(&model.Peer{Id: "dev-1", Hostname: "svr-suc47", UserId: 1, Os: "Windows", Username: "op"})
+	// Existing AB entry, PINNED, in collection 3 with a manual alias + tag.
+	db.Create(&model.AddressBook{
+		Id: "dev-1", UserId: 1, CollectionId: 3, Pinned: true,
+		Hostname: "OLD", Alias: "manual-alias", Tags: service.EncodeTags([]string{"keep"}),
+	})
+	seedRuleTags(db, 1, model.MatcherTypeContains, "suc47", 47, []string{"site"}, 10)
+
+	router := pcRouter(makeUser(1))
+
+	// Simulate: reports the entry as pinned, still shows the would-be proposal,
+	// but counts it under pinned_skipped and never as a change.
+	resp := pcPost(t, router, "/simulate")
+	if respCode(resp) != 0 {
+		t.Fatalf("simulate failed: %v", resp)
+	}
+	if dataInt(resp, "pinned_skipped") != 1 || dataInt(resp, "moved") != 0 {
+		t.Errorf("want pinned_skipped=1 moved=0, got %v", resp["data"])
+	}
+	row := firstResult(resp)
+	if row["action"] != "pinned" {
+		t.Errorf("action: want pinned, got %v", row["action"])
+	}
+	if row["pinned"] != true {
+		t.Errorf("pinned flag: want true, got %v", row["pinned"])
+	}
+	if row["changes"] != false {
+		t.Errorf("changes: want false for pinned, got %v", row["changes"])
+	}
+	// Informative: the proposed collection (what the rule WOULD do) is visible.
+	if pc, _ := row["proposed_collection_id"].(float64); pc != 47 {
+		t.Errorf("proposed_collection_id should still show 47 (informative), got %v", row["proposed_collection_id"])
+	}
+
+	// Apply: entry is untouched — collection, alias and tags all preserved.
+	resp = pcPost(t, router, "/apply")
+	if respCode(resp) != 0 {
+		t.Fatalf("apply failed: %v", resp)
+	}
+	if dataInt(resp, "pinned_skipped") != 1 || dataInt(resp, "moved") != 0 {
+		t.Errorf("apply summary: want pinned_skipped=1 moved=0, got %v", resp["data"])
+	}
+	var ab model.AddressBook
+	db.Where("user_id = ? AND id = ?", 1, "dev-1").First(&ab)
+	if ab.CollectionId != 3 {
+		t.Errorf("pinned collection changed: want 3, got %d", ab.CollectionId)
+	}
+	if ab.Alias != "manual-alias" {
+		t.Errorf("pinned alias changed: want manual-alias, got %q", ab.Alias)
+	}
+	tags := service.DecodeTags(ab.Tags)
+	if len(tags) != 1 || tags[0] != "keep" {
+		t.Errorf("pinned tags changed: want [keep], got %v", tags)
+	}
+	// Audit records the pinned skip.
+	var audits []model.AuditPeerClassification
+	db.Find(&audits)
+	if len(audits) != 1 || audits[0].PinnedSkipped != 1 {
+		t.Errorf("audit pinned_skipped: want 1, got %+v", audits)
+	}
+}
+
+// TestPinned_NonPinnedUnaffected confirms clearing the pin restores normal
+// classification (no regression path).
+func TestPinned_NonPinnedUnaffected(t *testing.T) {
+	db := setupPCHandlerDB(t)
+	db.Create(&model.Peer{Id: "dev-2", Hostname: "svr-suc47", UserId: 1, Os: "Windows"})
+	db.Create(&model.AddressBook{
+		Id: "dev-2", UserId: 1, CollectionId: 3, Pinned: false,
+		Alias: "manual", Tags: service.EncodeTags([]string{"keep"}),
+	})
+	seedRuleTags(db, 1, model.MatcherTypeContains, "suc47", 47, []string{"site"}, 10)
+
+	resp := pcPost(t, pcRouter(makeUser(1)), "/apply")
+	if dataInt(resp, "moved") != 1 || dataInt(resp, "pinned_skipped") != 0 {
+		t.Errorf("non-pinned should move: want moved=1 pinned_skipped=0, got %v", resp["data"])
+	}
+	var ab model.AddressBook
+	db.Where("user_id = ? AND id = ?", 1, "dev-2").First(&ab)
+	if ab.CollectionId != 47 || ab.Alias != "svr-suc47" {
+		t.Errorf("non-pinned not classified: collection=%d alias=%q", ab.CollectionId, ab.Alias)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pin toggle endpoint + user scope
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestPin_ToggleAndScope(t *testing.T) {
+	db := setupPCHandlerDB(t)
+
+	// pinnedOf reads the current pinned flag freshly (avoid struct-reuse gotchas).
+	pinnedOf := func(rowId uint) bool {
+		var r model.AddressBook
+		db.Where("row_id = ?", rowId).First(&r)
+		return r.Pinned
+	}
+
+	// AB entry owned by user 1, and one owned by user 2.
+	ab1 := &model.AddressBook{Id: "p1", UserId: 1, CollectionId: 0, Tags: service.EncodeTags(nil)}
+	db.Create(ab1)
+	ab2 := &model.AddressBook{Id: "p2", UserId: 2, CollectionId: 0, Tags: service.EncodeTags(nil)}
+	db.Create(ab2)
+
+	// User 1 pins their own entry.
+	resp := pcPostBody(t, pcRouter(makeUser(1)), "/pin", map[string]interface{}{"row_id": ab1.RowId, "pinned": true})
+	if respCode(resp) != 0 {
+		t.Fatalf("self-pin failed: %v", resp)
+	}
+	if !pinnedOf(ab1.RowId) {
+		t.Error("entry should be pinned after toggle on")
+	}
+
+	// User 1 unpins their own entry.
+	resp = pcPostBody(t, pcRouter(makeUser(1)), "/pin", map[string]interface{}{"row_id": ab1.RowId, "pinned": false})
+	if respCode(resp) != 0 {
+		t.Fatalf("self-unpin failed: %v", resp)
+	}
+	if pinnedOf(ab1.RowId) {
+		t.Error("entry should be unpinned after toggle off")
+	}
+
+	// User 1 (non-admin) tries to pin user 2's entry → rejected, unchanged.
+	resp = pcPostBody(t, pcRouter(makeUser(1)), "/pin", map[string]interface{}{"row_id": ab2.RowId, "pinned": true})
+	if respCode(resp) == 0 {
+		t.Error("cross-user pin by non-admin must be rejected")
+	}
+	if pinnedOf(ab2.RowId) {
+		t.Error("user 2's entry must remain unpinned after rejected cross-user attempt")
+	}
+
+	// An admin CAN pin another user's entry.
+	resp = pcPostBody(t, pcRouter(makeAdmin(9)), "/pin", map[string]interface{}{"row_id": ab2.RowId, "pinned": true})
+	if respCode(resp) != 0 {
+		t.Fatalf("admin cross-user pin should succeed: %v", resp)
+	}
+	if !pinnedOf(ab2.RowId) {
+		t.Error("admin pin should have taken effect")
+	}
+
+	// Missing entry → ItemNotFound.
+	resp = pcPostBody(t, pcRouter(makeUser(1)), "/pin", map[string]interface{}{"row_id": 99999, "pinned": true})
+	if respCode(resp) == 0 {
+		t.Error("pinning a non-existent entry must fail")
 	}
 }
 

@@ -238,6 +238,7 @@ func PeerClassificationBind(rg *gin.RouterGroup) {
 		pc.POST("/rule/create", cont.Create)
 		pc.POST("/rule/update", cont.Update)
 		pc.POST("/rule/delete", cont.Delete)
+		pc.POST("/pin", cont.Pin)
 		pc.POST("/simulate", cont.Simulate)
 		pc.POST("/apply", cont.Apply)
 	}

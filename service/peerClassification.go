@@ -290,6 +290,7 @@ const (
 	PCActionUpdate    = "update"    // existing AB entry, same collection, alias/tags change
 	PCActionUnchanged = "unchanged" // matched a collection but everything already correct
 	PCActionNone      = "none"      // no collection rule matched → peer left untouched
+	PCActionPinned    = "pinned"    // matched a collection rule but the entry is pinned → protected
 )
 
 // PeerClassificationResult is the per-peer outcome shared by /simulate and /apply.
@@ -305,16 +306,21 @@ type PeerClassificationResult struct {
 	ProposedAlias        string   `json:"proposed_alias"`
 	Action               string   `json:"action"`
 	Changes              bool     `json:"changes"`
+	// Pinned reflects the entry's pinned flag. When true and a rule matched, the
+	// proposed_* fields still show what the rule WOULD have done, but Changes is
+	// false and the entry is left untouched.
+	Pinned bool `json:"pinned"`
 }
 
 // PlanSummary aggregates a plan/apply run.
 type PlanSummary struct {
-	Total     int `json:"total"`
-	Created   int `json:"created"`
-	Moved     int `json:"moved"`
-	Updated   int `json:"updated"`
-	Unchanged int `json:"unchanged"`
-	NoMatch   int `json:"no_match"`
+	Total         int `json:"total"`
+	Created       int `json:"created"`
+	Moved         int `json:"moved"`
+	Updated       int `json:"updated"`
+	Unchanged     int `json:"unchanged"`
+	NoMatch       int `json:"no_match"`
+	PinnedSkipped int `json:"pinned_skipped"`
 }
 
 // currentABEntry returns the (single) address-book entry that this system
@@ -375,6 +381,7 @@ func (s *PeerClassificationService) BuildPlan(userId uint) ([]PeerClassification
 			res.CurrentCollectionId = &cid
 			res.CurrentTags = DecodeTags(ab.Tags)
 			res.CurrentAlias = ab.Alias
+			res.Pinned = ab.Pinned
 		}
 
 		if outcome.TargetCollectionId == nil {
@@ -391,6 +398,16 @@ func (s *PeerClassificationService) BuildPlan(userId uint) ([]PeerClassification
 		res.ProposedCollectionId = outcome.TargetCollectionId
 		res.ProposedAlias = p.Hostname // alias mirrors the live hostname
 		res.ProposedTags = unionTags(res.CurrentTags, outcome.Tags)
+
+		// Pinned entries are protected: a rule matched, and the proposed_* fields
+		// above show what it WOULD have done, but the entry is left untouched.
+		if res.Pinned {
+			res.Action = PCActionPinned
+			res.Changes = false
+			summary.PinnedSkipped++
+			results = append(results, res)
+			continue
+		}
 
 		switch {
 		case ab == nil:
@@ -481,13 +498,14 @@ func (s *PeerClassificationService) Apply(userId, adminId uint) ([]PeerClassific
 
 	// Audit (best-effort; never blocks the response).
 	_ = s.CreateApplyAudit(&model.AuditPeerClassification{
-		AdminId: adminId,
-		UserId:  userId,
-		Total:   summary.Total,
-		Created: summary.Created,
-		Moved:   summary.Moved,
-		Updated: summary.Updated,
-		NoMatch: summary.NoMatch,
+		AdminId:       adminId,
+		UserId:        userId,
+		Total:         summary.Total,
+		Created:       summary.Created,
+		Moved:         summary.Moved,
+		Updated:       summary.Updated,
+		NoMatch:       summary.NoMatch,
+		PinnedSkipped: summary.PinnedSkipped,
 	})
 
 	return results, summary, nil
@@ -496,4 +514,9 @@ func (s *PeerClassificationService) Apply(userId, adminId uint) ([]PeerClassific
 // CreateApplyAudit persists one audit row for an apply run.
 func (s *PeerClassificationService) CreateApplyAudit(a *model.AuditPeerClassification) error {
 	return DB.Create(a).Error
+}
+
+// SetPinned sets/clears the pinned flag on the address-book entry with rowId.
+func (s *PeerClassificationService) SetPinned(rowId uint, pinned bool) error {
+	return DB.Model(&model.AddressBook{}).Where("row_id = ?", rowId).Update("pinned", pinned).Error
 }
