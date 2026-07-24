@@ -29,6 +29,7 @@ func setupPCHandlerDB(t *testing.T) *gorm.DB {
 	if err := db.AutoMigrate(
 		&model.PeerClassificationRule{},
 		&model.AuditPeerClassification{},
+		&model.AuditPeerClassificationItem{},
 		&model.AddressBook{},
 		&model.AddressBookCollection{},
 		&model.Peer{},

@@ -473,8 +473,11 @@ func pcWriteOneDefault(tx *gorm.DB, userId uint, r *PeerClassificationResult, pe
 // Apply computes the plan and executes every change inside a single transaction
 // (all-or-nothing). On any write error the whole batch rolls back and the error
 // is returned with no partial changes. adminId is the executing user; userId is
-// whose peers are classified (equal in the current /me-scoped controller). An
-// audit row is written best-effort after a successful commit.
+// whose peers are classified (equal in the current /me-scoped controller).
+//
+// The audit run AND its per-entry snapshot are written INSIDE the same
+// transaction (not best-effort as before): undo depends on the snapshot being
+// atomic with the changes it describes.
 func (s *PeerClassificationService) Apply(userId, adminId uint) ([]PeerClassificationResult, PlanSummary, error) {
 	results, summary := s.BuildPlan(userId)
 
@@ -488,12 +491,65 @@ func (s *PeerClassificationService) Apply(userId, adminId uint) ([]PeerClassific
 	}
 
 	err := DB.Transaction(func(tx *gorm.DB) error {
+		items := make([]*model.AuditPeerClassificationItem, 0)
 		for i := range results {
 			r := &results[i]
 			if !r.Changes {
 				continue
 			}
-			if err := pcWriteOne(tx, userId, r, peerById[r.PeerId]); err != nil {
+			peer := peerById[r.PeerId]
+
+			item := &model.AuditPeerClassificationItem{
+				PeerId:              r.PeerId,
+				Operation:           r.Action,
+				AppliedCollectionId: *r.ProposedCollectionId,
+				AppliedAlias:        peer.Hostname,
+				AppliedTags:         EncodeTags(r.ProposedTags),
+			}
+			// For moved/updated, snapshot the previous state before overwriting.
+			if r.Action != PCActionCreate {
+				var prev model.AddressBook
+				if err := tx.Where("user_id = ? AND id = ?", userId, r.PeerId).First(&prev).Error; err != nil {
+					return err
+				}
+				item.RowId = prev.RowId
+				item.PrevCollectionId = prev.CollectionId
+				item.PrevAlias = prev.Alias
+				item.PrevTags = normalizeTags(prev.Tags)
+			}
+
+			if err := pcWriteOne(tx, userId, r, peer); err != nil {
+				return err
+			}
+
+			// For created rows, capture the freshly assigned row_id.
+			if r.Action == PCActionCreate {
+				var created model.AddressBook
+				if err := tx.Where("user_id = ? AND id = ?", userId, r.PeerId).First(&created).Error; err != nil {
+					return err
+				}
+				item.RowId = created.RowId
+			}
+			items = append(items, item)
+		}
+
+		audit := &model.AuditPeerClassification{
+			Kind:          model.AuditPCKindApply,
+			AdminId:       adminId,
+			UserId:        userId,
+			Total:         summary.Total,
+			Created:       summary.Created,
+			Moved:         summary.Moved,
+			Updated:       summary.Updated,
+			NoMatch:       summary.NoMatch,
+			PinnedSkipped: summary.PinnedSkipped,
+		}
+		if err := tx.Create(audit).Error; err != nil {
+			return err
+		}
+		for _, it := range items {
+			it.AuditId = audit.Id
+			if err := tx.Create(it).Error; err != nil {
 				return err
 			}
 		}
@@ -503,19 +559,13 @@ func (s *PeerClassificationService) Apply(userId, adminId uint) ([]PeerClassific
 		return nil, PlanSummary{}, err
 	}
 
-	// Audit (best-effort; never blocks the response).
-	_ = s.CreateApplyAudit(&model.AuditPeerClassification{
-		AdminId:       adminId,
-		UserId:        userId,
-		Total:         summary.Total,
-		Created:       summary.Created,
-		Moved:         summary.Moved,
-		Updated:       summary.Updated,
-		NoMatch:       summary.NoMatch,
-		PinnedSkipped: summary.PinnedSkipped,
-	})
-
 	return results, summary, nil
+}
+
+// normalizeTags returns a canonical JSON array for a tag blob (defaults empty
+// to "[]"), so snapshots compare cleanly.
+func normalizeTags(raw custom_types.AutoJson) custom_types.AutoJson {
+	return EncodeTags(DecodeTags(raw))
 }
 
 // CreateApplyAudit persists one audit row for an apply run.

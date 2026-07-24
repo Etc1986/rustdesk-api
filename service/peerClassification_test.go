@@ -22,6 +22,7 @@ func setupPCTestDB(t *testing.T) *gorm.DB {
 	if err := db.AutoMigrate(
 		&model.PeerClassificationRule{},
 		&model.AuditPeerClassification{},
+		&model.AuditPeerClassificationItem{},
 		&model.AddressBook{},
 		&model.AddressBookCollection{},
 		&model.Peer{},
@@ -372,5 +373,82 @@ func TestApply_HappyPathAudit(t *testing.T) {
 	}
 	if ab.CollectionId != 5 {
 		t.Errorf("collection: want 5, got %d", ab.CollectionId)
+	}
+}
+
+// TestApply_CapturesSnapshot verifies the per-entry snapshot is recorded with
+// correct previous and applied state for both a created and a moved entry.
+func TestApply_CapturesSnapshot(t *testing.T) {
+	setupPCTestDB(t)
+	svc := &PeerClassificationService{}
+
+	// Rule: contains suc47 -> collection 47, tag "site".
+	rule := &model.PeerClassificationRule{
+		UserId: 1, MatcherType: model.MatcherTypeContains, Pattern: "suc47",
+		TargetCollectionId: uptr(47), TargetTags: EncodeTags([]string{"site"}), Priority: 10, Active: true,
+	}
+	if err := svc.CreateRule(rule); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	// Peer A: not in AB → will be created.
+	DB.Create(&model.Peer{Id: "new-1", Hostname: "svr-suc47", UserId: 0, Os: "Windows", Username: "op"})
+	// Peer B: already in AB in collection 3 → will be moved to 47.
+	DB.Create(&model.Peer{Id: "old-1", Hostname: "wks-suc47", UserId: 0, Os: "Windows"})
+	DB.Create(&model.AddressBook{
+		Id: "old-1", UserId: 1, CollectionId: 3, Alias: "prev-alias", Tags: EncodeTags([]string{"keep"}),
+	})
+
+	if _, _, err := svc.Apply(1, 1); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	// One apply run.
+	var run model.AuditPeerClassification
+	if err := DB.Where("kind = ?", model.AuditPCKindApply).First(&run).Error; err != nil {
+		t.Fatalf("no apply run: %v", err)
+	}
+	// Two snapshot items linked to it.
+	var items []model.AuditPeerClassificationItem
+	DB.Where("audit_id = ?", run.Id).Order("operation asc").Find(&items)
+	if len(items) != 2 {
+		t.Fatalf("want 2 snapshot items, got %d", len(items))
+	}
+
+	byPeer := map[string]model.AuditPeerClassificationItem{}
+	for _, it := range items {
+		byPeer[it.PeerId] = it
+	}
+
+	// Created item: operation=created, applied state set, prev empty.
+	created := byPeer["new-1"]
+	if created.Operation != PCActionCreate {
+		t.Errorf("new-1 op: want created, got %q", created.Operation)
+	}
+	if created.RowId == 0 {
+		t.Error("created snapshot must record the new row_id (for deletion on undo)")
+	}
+	if created.AppliedCollectionId != 47 || created.AppliedAlias != "svr-suc47" {
+		t.Errorf("created applied state wrong: %+v", created)
+	}
+	if created.PrevCollectionId != 0 || created.PrevAlias != "" {
+		t.Errorf("created prev state should be empty: %+v", created)
+	}
+
+	// Moved item: prev state = the pre-apply values; applied = new values.
+	moved := byPeer["old-1"]
+	if moved.Operation != PCActionMove {
+		t.Errorf("old-1 op: want move, got %q", moved.Operation)
+	}
+	if moved.PrevCollectionId != 3 || moved.PrevAlias != "prev-alias" {
+		t.Errorf("moved prev state wrong: %+v", moved)
+	}
+	if prev := DecodeTags(moved.PrevTags); len(prev) != 1 || prev[0] != "keep" {
+		t.Errorf("moved prev tags: want [keep], got %v", prev)
+	}
+	if moved.AppliedCollectionId != 47 || moved.AppliedAlias != "wks-suc47" {
+		t.Errorf("moved applied state wrong: %+v", moved)
+	}
+	if app := DecodeTags(moved.AppliedTags); len(app) != 2 {
+		t.Errorf("moved applied tags: want 2 (keep+site union), got %v", app)
 	}
 }
