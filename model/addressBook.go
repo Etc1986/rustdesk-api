@@ -37,6 +37,11 @@ type AddressBook struct {
 	SameServer       bool                   `json:"sameServer" gorm:"default:0;not null;"`
 	CollectionId     uint                   `json:"collection_id" gorm:"default:0;not null;index"`
 	Collection       *AddressBookCollection `json:"collection,omitempty"`
+	// Pinned marks an entry as manually curated: the peer-classification engine
+	// must never modify it (collection, alias or tags). It protects the entry,
+	// not the peer — the same peer can be pinned in one collection and freely
+	// classified in another.
+	Pinned bool `json:"pinned" gorm:"default:0;not null;index"`
 	TimeModel
 }
 

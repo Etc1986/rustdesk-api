@@ -54,11 +54,12 @@ type AuditPeerClassification struct {
 	IdModel
 	AdminId  uint `json:"admin_id" gorm:"default:0;not null;index"` // who executed the run
 	UserId   uint `json:"user_id" gorm:"default:0;not null;index"`  // whose peers were evaluated
-	Total    int  `json:"total" gorm:"default:0;not null"`          // peers evaluated
-	Created  int  `json:"created" gorm:"default:0;not null"`        // AB entries newly created
-	Moved    int  `json:"moved" gorm:"default:0;not null"`          // entries whose collection changed
-	Updated  int  `json:"updated" gorm:"default:0;not null"`        // entries touched (alias/tags) without a move
-	NoMatch  int  `json:"no_match" gorm:"default:0;not null"`       // peers matching no collection rule (untouched)
+	Total         int `json:"total" gorm:"default:0;not null"`          // peers evaluated
+	Created       int `json:"created" gorm:"default:0;not null"`        // AB entries newly created
+	Moved         int `json:"moved" gorm:"default:0;not null"`          // entries whose collection changed
+	Updated       int `json:"updated" gorm:"default:0;not null"`        // entries touched (alias/tags) without a move
+	NoMatch       int `json:"no_match" gorm:"default:0;not null"`       // peers matching no collection rule (untouched)
+	PinnedSkipped int `json:"pinned_skipped" gorm:"default:0;not null"` // pinned entries left untouched despite a match
 	TimeModel
 }
 
