@@ -171,3 +171,11 @@ other = "Registro exitoso, espere la confirmación del administrador."
 [PeerClassificationRuleConflict]
 description = "Another rule with the same priority already routes overlapping hostnames to a different collection."
 one = "Otra regla con la misma prioridad ya enruta hostnames solapados a una colección distinta. Usa una prioridad diferente para desambiguar."
+
+[PeerClassificationNoRun]
+description = "There is no apply run to undo."
+one = "No hay ninguna aplicación que deshacer."
+
+[PeerClassificationAlreadyReverted]
+description = "The last apply run has already been undone."
+one = "La última aplicación ya fue deshecha; no hay nada que revertir."

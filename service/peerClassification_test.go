@@ -452,3 +452,61 @@ func TestApply_CapturesSnapshot(t *testing.T) {
 		t.Errorf("moved applied tags: want 2 (keep+site union), got %v", app)
 	}
 }
+
+// TestUndo_RollbackOnMidFailure verifies a fault mid-undo rolls back completely:
+// no entries changed, the run is not marked reverted, no undo event is written.
+func TestUndo_RollbackOnMidFailure(t *testing.T) {
+	setupPCTestDB(t)
+	svc := &PeerClassificationService{}
+
+	rule := &model.PeerClassificationRule{
+		UserId: 1, MatcherType: model.MatcherTypePrefix, Pattern: "svr-",
+		TargetCollectionId: uptr(5), TargetTags: EncodeTags(nil), Priority: 10, Active: true,
+	}
+	if err := svc.CreateRule(rule); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		DB.Create(&model.Peer{Id: fmt.Sprintf("svr-%d", i), Hostname: fmt.Sprintf("svr-%d", i), UserId: 0, Os: "Windows"})
+	}
+	if _, _, err := svc.Apply(1, 1); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	var abBefore int64
+	DB.Model(&model.AddressBook{}).Count(&abBefore) // 3 created
+
+	// Inject a fault on the 2nd undo mutation.
+	orig := pcUndoOne
+	defer func() { pcUndoOne = orig }()
+	calls := 0
+	pcUndoOne = func(tx *gorm.DB, item *model.AuditPeerClassificationItem) error {
+		calls++
+		if calls == 2 {
+			return fmt.Errorf("injected undo fault")
+		}
+		return orig(tx, item)
+	}
+
+	if _, err := svc.Undo(1, 1); err == nil {
+		t.Fatal("expected undo to fail on injected fault")
+	}
+
+	// Nothing changed: all 3 entries still present.
+	var abAfter int64
+	DB.Model(&model.AddressBook{}).Count(&abAfter)
+	if abAfter != abBefore {
+		t.Errorf("rollback incomplete: AB rows before=%d after=%d", abBefore, abAfter)
+	}
+	// The apply run must NOT be marked reverted.
+	var run model.AuditPeerClassification
+	DB.Where("kind = ?", model.AuditPCKindApply).First(&run)
+	if run.RevertedByAuditId != 0 {
+		t.Error("apply run must not be marked reverted after a failed undo")
+	}
+	// No undo event persisted.
+	var undoCount int64
+	DB.Model(&model.AuditPeerClassification{}).Where("kind = ?", model.AuditPCKindUndo).Count(&undoCount)
+	if undoCount != 0 {
+		t.Errorf("no undo event should be written on rollback, got %d", undoCount)
+	}
+}

@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -63,7 +64,28 @@ func pcRouter(curUser *model.User) *gin.Engine {
 	r.POST("/simulate", inject(ct.Simulate))
 	r.POST("/apply", inject(ct.Apply))
 	r.POST("/pin", inject(ct.Pin))
+	r.POST("/undo", inject(ct.Undo))
+	r.GET("/last-run", inject(ct.LastRun))
 	return r
+}
+
+// pcGet issues a GET and decodes the response.
+func pcGet(t *testing.T, router *gin.Engine, path string) map[string]interface{} {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal %q: %v", w.Body.String(), err)
+	}
+	return resp
+}
+
+// dataMap returns the nested data object of a response.
+func dataMap(resp map[string]interface{}) map[string]interface{} {
+	d, _ := resp["data"].(map[string]interface{})
+	return d
 }
 
 // makeAdmin returns a *model.User with Id set and IsAdmin=true.
@@ -498,5 +520,199 @@ func TestSimulateApply_EvaluatesPeersWithUserIdZero(t *testing.T) {
 	db.Where("id = ?", "real-1").First(&ab)
 	if ab.UserId != 1 || ab.CollectionId != 47 || ab.Alias != "svr-suc47" {
 		t.Errorf("user_id=0 peer not classified into user 1's book: %+v", ab)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Undo: snapshot-based reversal of the last apply run
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Test: apply that creates 3 entries → undo deletes them, DB identical to before.
+func TestUndo_DeletesCreatedEntries(t *testing.T) {
+	db := setupPCHandlerDB(t)
+	seedRule(db, 1, model.MatcherTypePrefix, "svr-", 5, 10)
+	for i := 0; i < 3; i++ {
+		db.Create(&model.Peer{Id: fmt.Sprintf("svr-%d", i), Hostname: fmt.Sprintf("svr-%d", i), UserId: 0, Os: "Windows"})
+	}
+	router := pcRouter(makeUser(1))
+
+	before := abCount(db)
+	if resp := pcPost(t, router, "/apply"); dataInt(resp, "created") != 3 {
+		t.Fatalf("apply should create 3: %v", resp["data"])
+	}
+	if abCount(db) != before+3 {
+		t.Fatalf("expected 3 new AB rows")
+	}
+
+	resp := pcPost(t, router, "/undo")
+	if respCode(resp) != 0 {
+		t.Fatalf("undo failed: %v", resp)
+	}
+	if dataInt(resp, "deleted") != 3 || dataInt(resp, "restored") != 0 {
+		t.Errorf("want deleted=3 restored=0, got %v", resp["data"])
+	}
+	if abCount(db) != before {
+		t.Errorf("undo must restore row count to %d, got %d", before, abCount(db))
+	}
+}
+
+// Test: apply that moves 2 entries → undo restores collection_id, alias, tags.
+func TestUndo_RestoresMovedEntries(t *testing.T) {
+	db := setupPCHandlerDB(t)
+	seedRuleTags(db, 1, model.MatcherTypeContains, "suc47", 47, []string{"site"}, 10)
+
+	// Two peers already in AB (collection 3) whose hostnames now match the rule.
+	for _, id := range []string{"a", "b"} {
+		db.Create(&model.Peer{Id: id, Hostname: "svr-suc47-" + id, UserId: 0, Os: "Windows"})
+		db.Create(&model.AddressBook{
+			Id: id, UserId: 1, CollectionId: 3, Alias: "orig-" + id,
+			Tags: service.EncodeTags([]string{"orig-" + id}),
+		})
+	}
+	router := pcRouter(makeUser(1))
+
+	if resp := pcPost(t, router, "/apply"); dataInt(resp, "moved") != 2 {
+		t.Fatalf("apply should move 2: %v", resp["data"])
+	}
+	// Confirm they moved.
+	var movedAb model.AddressBook
+	db.Where("user_id = ? AND id = ?", 1, "a").First(&movedAb)
+	if movedAb.CollectionId != 47 {
+		t.Fatalf("precondition: entry a should be in collection 47, got %d", movedAb.CollectionId)
+	}
+
+	resp := pcPost(t, router, "/undo")
+	if respCode(resp) != 0 {
+		t.Fatalf("undo failed: %v", resp)
+	}
+	if dataInt(resp, "restored") != 2 || dataInt(resp, "deleted") != 0 {
+		t.Errorf("want restored=2 deleted=0, got %v", resp["data"])
+	}
+	for _, id := range []string{"a", "b"} {
+		var ab model.AddressBook
+		db.Where("user_id = ? AND id = ?", 1, id).First(&ab)
+		if ab.CollectionId != 3 {
+			t.Errorf("%s: collection not restored, got %d", id, ab.CollectionId)
+		}
+		if ab.Alias != "orig-"+id {
+			t.Errorf("%s: alias not restored, got %q", id, ab.Alias)
+		}
+		tags := service.DecodeTags(ab.Tags)
+		if len(tags) != 1 || tags[0] != "orig-"+id {
+			t.Errorf("%s: tags not restored, got %v", id, tags)
+		}
+	}
+}
+
+// Test: an entry modified manually after apply → undo skips and reports it.
+func TestUndo_SkipsManuallyModified(t *testing.T) {
+	db := setupPCHandlerDB(t)
+	seedRule(db, 1, model.MatcherTypeContains, "suc47", 47, 10)
+	db.Create(&model.Peer{Id: "m1", Hostname: "svr-suc47", UserId: 0, Os: "Windows"})
+	db.Create(&model.AddressBook{Id: "m1", UserId: 1, CollectionId: 3, Alias: "orig", Tags: service.EncodeTags(nil)})
+	router := pcRouter(makeUser(1))
+
+	pcPost(t, router, "/apply") // moves m1 to collection 47
+
+	// A human edits the alias after the apply.
+	db.Model(&model.AddressBook{}).Where("user_id = ? AND id = ?", 1, "m1").Update("alias", "human-touched")
+
+	resp := pcPost(t, router, "/undo")
+	if respCode(resp) != 0 {
+		t.Fatalf("undo failed: %v", resp)
+	}
+	if dataInt(resp, "skipped_modified") != 1 || dataInt(resp, "restored") != 0 {
+		t.Errorf("want skipped_modified=1 restored=0, got %v", resp["data"])
+	}
+	// The human's change and the apply's collection must remain (not reverted).
+	var ab model.AddressBook
+	db.Where("user_id = ? AND id = ?", 1, "m1").First(&ab)
+	if ab.Alias != "human-touched" || ab.CollectionId != 47 {
+		t.Errorf("modified entry must not be reverted: alias=%q col=%d", ab.Alias, ab.CollectionId)
+	}
+}
+
+// Test: an entry pinned after apply → undo doesn't touch it.
+func TestUndo_SkipsPinnedAfterApply(t *testing.T) {
+	db := setupPCHandlerDB(t)
+	seedRule(db, 1, model.MatcherTypePrefix, "svr-", 5, 10)
+	db.Create(&model.Peer{Id: "p1", Hostname: "svr-1", UserId: 0, Os: "Windows"})
+	router := pcRouter(makeUser(1))
+
+	pcPost(t, router, "/apply") // creates p1 in collection 5
+
+	// Pin it after the apply.
+	var created model.AddressBook
+	db.Where("user_id = ? AND id = ?", 1, "p1").First(&created)
+	db.Model(&model.AddressBook{}).Where("row_id = ?", created.RowId).Update("pinned", true)
+
+	resp := pcPost(t, router, "/undo")
+	if respCode(resp) != 0 {
+		t.Fatalf("undo failed: %v", resp)
+	}
+	if dataInt(resp, "skipped_pinned") != 1 || dataInt(resp, "deleted") != 0 {
+		t.Errorf("want skipped_pinned=1 deleted=0, got %v", resp["data"])
+	}
+	// The pinned entry must still exist.
+	var cnt int64
+	db.Model(&model.AddressBook{}).Where("user_id = ? AND id = ?", 1, "p1").Count(&cnt)
+	if cnt != 1 {
+		t.Errorf("pinned entry must survive undo, count=%d", cnt)
+	}
+}
+
+// Test: undo twice → the second fails with a clear reason.
+func TestUndo_TwiceFails(t *testing.T) {
+	db := setupPCHandlerDB(t)
+	seedRule(db, 1, model.MatcherTypePrefix, "svr-", 5, 10)
+	db.Create(&model.Peer{Id: "svr-x", Hostname: "svr-x", UserId: 0, Os: "Windows"})
+	router := pcRouter(makeUser(1))
+
+	pcPost(t, router, "/apply")
+	if resp := pcPost(t, router, "/undo"); respCode(resp) != 0 {
+		t.Fatalf("first undo should succeed: %v", resp)
+	}
+	resp := pcPost(t, router, "/undo")
+	if respCode(resp) == 0 {
+		t.Error("second undo must fail (already reverted / no redo)")
+	}
+	if msg, _ := resp["message"].(string); msg == "" {
+		t.Error("second undo must return a message")
+	}
+}
+
+// Test: no previous runs → last-run responds gracefully.
+func TestLastRun_NoRuns(t *testing.T) {
+	setupPCHandlerDB(t)
+	resp := pcGet(t, pcRouter(makeUser(1)), "/last-run")
+	if respCode(resp) != 0 {
+		t.Fatalf("last-run failed: %v", resp)
+	}
+	d := dataMap(resp)
+	if d["has_run"] != false || d["reversible"] != false || d["reason"] != "no_runs" {
+		t.Errorf("want has_run=false reversible=false reason=no_runs, got %v", d)
+	}
+	if d["run"] != nil {
+		t.Errorf("run should be null, got %v", d["run"])
+	}
+}
+
+// Test: last-run reports a reversible run, then not-reversible after undo.
+func TestLastRun_ReversibleThenReverted(t *testing.T) {
+	db := setupPCHandlerDB(t)
+	seedRule(db, 1, model.MatcherTypePrefix, "svr-", 5, 10)
+	db.Create(&model.Peer{Id: "svr-x", Hostname: "svr-x", UserId: 0, Os: "Windows"})
+	router := pcRouter(makeUser(1))
+
+	pcPost(t, router, "/apply")
+	d := dataMap(pcGet(t, router, "/last-run"))
+	if d["has_run"] != true || d["reversible"] != true {
+		t.Errorf("after apply last-run should be reversible, got %v", d)
+	}
+
+	pcPost(t, router, "/undo")
+	d = dataMap(pcGet(t, router, "/last-run"))
+	if d["reversible"] != false || d["reason"] != "already_reverted" {
+		t.Errorf("after undo last-run should be already_reverted, got %v", d)
 	}
 }

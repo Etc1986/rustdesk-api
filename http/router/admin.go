@@ -241,6 +241,8 @@ func PeerClassificationBind(rg *gin.RouterGroup) {
 		pc.POST("/pin", cont.Pin)
 		pc.POST("/simulate", cont.Simulate)
 		pc.POST("/apply", cont.Apply)
+		pc.POST("/undo", cont.Undo)
+		pc.GET("/last-run", cont.LastRun)
 	}
 }
 func UserTokenBind(rg *gin.RouterGroup) {

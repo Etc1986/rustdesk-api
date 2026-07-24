@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"errors"
+
 	"github.com/gin-gonic/gin"
 	"github.com/lejianwen/rustdesk-api/v2/global"
 	"github.com/lejianwen/rustdesk-api/v2/http/request/admin"
@@ -199,6 +201,49 @@ func (ct *PeerClassificationRule) Apply(c *gin.Context) {
 		return
 	}
 	response.Success(c, classificationPayload(true, summary, results))
+}
+
+// Undo reverts the current user's most recent apply run.
+// @Router /admin/peer_classification/undo [post]
+func (ct *PeerClassificationRule) Undo(c *gin.Context) {
+	u := service.AllService.UserService.CurUser(c)
+	res, err := service.AllService.PeerClassificationService.Undo(u.Id, u.Id)
+	if err != nil {
+		if errors.Is(err, service.ErrNoRun) || errors.Is(err, service.ErrAlreadyReverted) {
+			response.Fail(c, 101, response.TranslateMsg(c, err.Error()))
+			return
+		}
+		response.Fail(c, 101, response.TranslateMsg(c, "OperationFailed")+err.Error())
+		return
+	}
+	response.Success(c, res)
+}
+
+// LastRun reports the current user's most recent apply run and whether it can
+// still be undone.
+// @Router /admin/peer_classification/last-run [get]
+func (ct *PeerClassificationRule) LastRun(c *gin.Context) {
+	u := service.AllService.UserService.CurUser(c)
+	info := service.AllService.PeerClassificationService.LastRun(u.Id)
+	payload := gin.H{
+		"has_run":    info.Run != nil,
+		"reversible": info.Reversible,
+		"reason":     info.Reason,
+		"run":        nil,
+	}
+	if info.Run != nil {
+		payload["run"] = gin.H{
+			"id":             info.Run.Id,
+			"created_at":     info.Run.CreatedAt,
+			"total":          info.Run.Total,
+			"created":        info.Run.Created,
+			"moved":          info.Run.Moved,
+			"updated":        info.Run.Updated,
+			"no_match":       info.Run.NoMatch,
+			"pinned_skipped": info.Run.PinnedSkipped,
+		}
+	}
+	response.Success(c, payload)
 }
 
 func classificationPayload(applied bool, s service.PlanSummary, results []service.PeerClassificationResult) gin.H {

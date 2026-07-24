@@ -162,3 +162,11 @@ other = "Register success, wait admin confirm."
 [PeerClassificationRuleConflict]
 description = "Another rule with the same priority already routes overlapping hostnames to a different collection."
 one = "Another rule with the same priority already routes overlapping hostnames to a different collection. Use a different priority to disambiguate."
+
+[PeerClassificationNoRun]
+description = "There is no apply run to undo."
+one = "There is no apply run to undo."
+
+[PeerClassificationAlreadyReverted]
+description = "The last apply run has already been undone."
+one = "The last apply run has already been undone; there is nothing to undo."

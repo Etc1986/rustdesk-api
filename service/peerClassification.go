@@ -2,12 +2,19 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"sort"
 	"strings"
 
 	"github.com/lejianwen/rustdesk-api/v2/model"
 	"github.com/lejianwen/rustdesk-api/v2/model/custom_types"
 	"gorm.io/gorm"
+)
+
+// Undo failure reasons (their strings double as i18n keys).
+var (
+	ErrNoRun           = errors.New("PeerClassificationNoRun")
+	ErrAlreadyReverted = errors.New("PeerClassificationAlreadyReverted")
 )
 
 // PeerClassificationService owns the rule-matching engine plus CRUD and
@@ -576,4 +583,156 @@ func (s *PeerClassificationService) CreateApplyAudit(a *model.AuditPeerClassific
 // SetPinned sets/clears the pinned flag on the address-book entry with rowId.
 func (s *PeerClassificationService) SetPinned(rowId uint, pinned bool) error {
 	return DB.Model(&model.AddressBook{}).Where("row_id = ?", rowId).Update("pinned", pinned).Error
+}
+
+// ───────────────────────────── Undo ─────────────────────────────
+
+// LastRunInfo describes the most recent apply run of a user and whether it can
+// still be undone.
+type LastRunInfo struct {
+	Run        *model.AuditPeerClassification
+	Reversible bool
+	Reason     string // "" if reversible; "no_runs" or "already_reverted" otherwise
+}
+
+// LastRun returns the user's most recent apply run and its reversibility. Only
+// the single most recent apply run is ever undoable (design decision): undoing
+// an older run with newer runs on top would produce inconsistent state.
+func (s *PeerClassificationService) LastRun(userId uint) LastRunInfo {
+	var run model.AuditPeerClassification
+	err := DB.Where("user_id = ? AND kind = ?", userId, model.AuditPCKindApply).
+		Order("id desc").First(&run).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return LastRunInfo{Run: nil, Reversible: false, Reason: "no_runs"}
+	}
+	if err != nil {
+		return LastRunInfo{Run: nil, Reversible: false, Reason: "no_runs"}
+	}
+	if run.RevertedByAuditId != 0 {
+		return LastRunInfo{Run: &run, Reversible: false, Reason: "already_reverted"}
+	}
+	return LastRunInfo{Run: &run, Reversible: true, Reason: ""}
+}
+
+// UndoResult summarises an undo run.
+type UndoResult struct {
+	RevertedAuditId uint `json:"reverted_audit_id"`
+	Deleted         int  `json:"deleted"`          // created entries removed
+	Restored        int  `json:"restored"`         // moved/updated entries restored
+	SkippedModified int  `json:"skipped_modified"` // changed after apply, left alone
+	SkippedPinned   int  `json:"skipped_pinned"`   // pinned after apply, left alone
+}
+
+// tagsSetEqual reports set (multiset) equality of two tag slices.
+func tagsSetEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	m := make(map[string]int, len(a))
+	for _, t := range a {
+		m[t]++
+	}
+	for _, t := range b {
+		m[t]--
+		if m[t] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// entryMatchesApplied reports whether an entry is still exactly as apply left it
+// (collection, alias and tag set). If not, a human changed it after the apply.
+func entryMatchesApplied(ab *model.AddressBook, item *model.AuditPeerClassificationItem) bool {
+	return ab.CollectionId == item.AppliedCollectionId &&
+		ab.Alias == item.AppliedAlias &&
+		tagsSetEqual(DecodeTags(ab.Tags), DecodeTags(item.AppliedTags))
+}
+
+// pcUndoOne performs the actual DB mutation for one snapshot item. Package var so
+// tests can inject a fault to verify full rollback.
+var pcUndoOne = pcUndoOneDefault
+
+func pcUndoOneDefault(tx *gorm.DB, item *model.AuditPeerClassificationItem) error {
+	if item.Operation == PCActionCreate {
+		return tx.Where("row_id = ?", item.RowId).Delete(&model.AddressBook{}).Error
+	}
+	return tx.Model(&model.AddressBook{}).Where("row_id = ?", item.RowId).
+		Updates(map[string]interface{}{
+			"collection_id": item.PrevCollectionId,
+			"alias":         item.PrevAlias,
+			"tags":          normalizeTags(item.PrevTags),
+		}).Error
+}
+
+// Undo reverts the user's most recent apply run, inside a single transaction:
+// created entries are deleted; moved/updated entries are restored to their
+// snapshot. Entries changed (or pinned) after the apply are left untouched and
+// reported. The undo is recorded as its own audit event and the original run is
+// marked reverted (so it cannot be undone again — there is no redo).
+func (s *PeerClassificationService) Undo(userId, adminId uint) (*UndoResult, error) {
+	info := s.LastRun(userId)
+	if info.Run == nil {
+		return nil, ErrNoRun
+	}
+	if !info.Reversible {
+		return nil, ErrAlreadyReverted
+	}
+	run := info.Run
+
+	var items []*model.AuditPeerClassificationItem
+	DB.Where("audit_id = ?", run.Id).Find(&items)
+
+	res := &UndoResult{RevertedAuditId: run.Id}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		for _, item := range items {
+			var ab model.AddressBook
+			err := tx.Where("row_id = ?", item.RowId).First(&ab).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				// Row deleted externally after apply → treat as modified.
+				res.SkippedModified++
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if ab.Pinned {
+				res.SkippedPinned++
+				continue
+			}
+			if !entryMatchesApplied(&ab, item) {
+				res.SkippedModified++
+				continue
+			}
+			if err := pcUndoOne(tx, item); err != nil {
+				return err
+			}
+			if item.Operation == PCActionCreate {
+				res.Deleted++
+			} else {
+				res.Restored++
+			}
+		}
+
+		undoEvent := &model.AuditPeerClassification{
+			Kind:            model.AuditPCKindUndo,
+			AdminId:         adminId,
+			UserId:          userId,
+			RevertedAuditId: run.Id,
+			Deleted:         res.Deleted,
+			Restored:        res.Restored,
+			SkippedModified: res.SkippedModified,
+			SkippedPinned:   res.SkippedPinned,
+		}
+		if err := tx.Create(undoEvent).Error; err != nil {
+			return err
+		}
+		// Mark the original run reverted so it cannot be undone again.
+		return tx.Model(&model.AuditPeerClassification{}).Where("id = ?", run.Id).
+			Update("reverted_by_audit_id", undoEvent.Id).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
 }
