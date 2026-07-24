@@ -324,3 +324,31 @@ func runScaleBatch(t *testing.T, n int) {
 func TestScale_2Peers(t *testing.T)   { runScaleBatch(t, 2) }
 func TestScale_10Peers(t *testing.T)  { runScaleBatch(t, 10) }
 func TestScale_100Peers(t *testing.T) { runScaleBatch(t, 100) }
+
+// TestUpdateAll_PreservesPinned ensures a regular admin edit (which does not
+// carry the pinned flag) never clears an entry's pin.
+func TestUpdateAll_PreservesPinned(t *testing.T) {
+	db := setupABTestDB(t)
+	svc := &AddressBookService{}
+
+	// Seed a pinned entry.
+	ab := &model.AddressBook{Id: "px", UserId: 1, CollectionId: 3, Pinned: true, Alias: "old", Tags: tagBytes()}
+	db.Create(ab)
+
+	// Simulate an admin edit: a form-built struct WITHOUT pinned (false), changing
+	// the alias, run through UpdateAll (Select("*")).
+	edit := &model.AddressBook{Alias: "new", Id: "px", UserId: 1, CollectionId: 3, Tags: tagBytes()}
+	edit.RowId = ab.RowId
+	if err := svc.UpdateAll(edit); err != nil {
+		t.Fatalf("UpdateAll: %v", err)
+	}
+
+	var reloaded model.AddressBook
+	db.Where("row_id = ?", ab.RowId).First(&reloaded)
+	if reloaded.Alias != "new" {
+		t.Errorf("alias should update: got %q", reloaded.Alias)
+	}
+	if !reloaded.Pinned {
+		t.Error("pinned must survive an admin edit that omits it")
+	}
+}

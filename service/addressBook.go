@@ -176,8 +176,10 @@ func (s *AddressBookService) UpdateByMap(u *model.AddressBook, data map[string]i
 }
 
 // UpdateAll 更新
+// Omits "pinned": that flag is owned exclusively by the classification pin
+// endpoint, so a regular admin edit (which doesn't carry it) must never reset it.
 func (s *AddressBookService) UpdateAll(u *model.AddressBook) error {
-	return DB.Model(u).Select("*").Omit("created_at").Updates(u).Error
+	return DB.Model(u).Select("*").Omit("created_at", "pinned").Updates(u).Error
 }
 
 // ShareByWebClient 分享
