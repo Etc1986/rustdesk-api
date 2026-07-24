@@ -24,6 +24,7 @@ type Service struct {
 	*ServerCmdService
 	*LdapService
 	*AppService
+	*PeerClassificationService
 }
 
 type Dependencies struct {
