@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/lejianwen/rustdesk-api/v2/model"
@@ -279,5 +280,97 @@ func TestFindDuplicate(t *testing.T) {
 	// Different user → not a duplicate.
 	if svc.FindDuplicate(2, model.MatcherTypeContains, "suc47", 0) != nil {
 		t.Error("different user must not be a duplicate")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test point 6: transaction rollback on a mid-batch failure (no partial writes)
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestApply_RollbackOnMidBatchFailure(t *testing.T) {
+	setupPCTestDB(t)
+	svc := &PeerClassificationService{}
+
+	// Rule: prefix svr- → collection 5.
+	rule := &model.PeerClassificationRule{
+		UserId: 1, MatcherType: model.MatcherTypePrefix, Pattern: "svr-",
+		TargetCollectionId: uptr(5), TargetTags: EncodeTags(nil), Priority: 10, Active: true,
+	}
+	if err := svc.CreateRule(rule); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	// Three peers, all matching → all "create".
+	for i := 0; i < 3; i++ {
+		DB.Create(&model.Peer{Id: fmt.Sprintf("svr-%d", i), Hostname: fmt.Sprintf("svr-%d", i), UserId: 1, Os: "Windows"})
+	}
+
+	// Inject a fault on the 2nd write to force a mid-batch failure.
+	orig := pcWriteOne
+	defer func() { pcWriteOne = orig }()
+	calls := 0
+	pcWriteOne = func(tx *gorm.DB, userId uint, r *PeerClassificationResult, peer *model.Peer) error {
+		calls++
+		if calls == 2 {
+			return fmt.Errorf("injected fault at write #2")
+		}
+		return orig(tx, userId, r, peer)
+	}
+
+	_, _, err := svc.Apply(1, 1)
+	if err == nil {
+		t.Fatal("expected Apply to return an error on injected fault")
+	}
+
+	// Rollback must be complete: zero address-book rows, zero audit rows.
+	var abCount, auditCount int64
+	DB.Model(&model.AddressBook{}).Count(&abCount)
+	DB.Model(&model.AuditPeerClassification{}).Count(&auditCount)
+	if abCount != 0 {
+		t.Errorf("rollback incomplete: %d address-book rows persisted, want 0", abCount)
+	}
+	if auditCount != 0 {
+		t.Errorf("audit must not be written when apply fails: got %d rows", auditCount)
+	}
+}
+
+// TestApply_HappyPathAudit confirms a successful apply writes exactly one audit
+// row with correct counters (complements the rollback test).
+func TestApply_HappyPathAudit(t *testing.T) {
+	setupPCTestDB(t)
+	svc := &PeerClassificationService{}
+
+	rule := &model.PeerClassificationRule{
+		UserId: 1, MatcherType: model.MatcherTypePrefix, Pattern: "svr-",
+		TargetCollectionId: uptr(5), TargetTags: EncodeTags([]string{"server"}), Priority: 10, Active: true,
+	}
+	if err := svc.CreateRule(rule); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	DB.Create(&model.Peer{Id: "svr-a", Hostname: "svr-a", UserId: 1, Os: "Windows", Username: "adm"})
+	DB.Create(&model.Peer{Id: "wks-b", Hostname: "wks-b", UserId: 1, Os: "Windows"}) // no match
+
+	_, summary, err := svc.Apply(1, 1)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if summary.Total != 2 || summary.Created != 1 || summary.NoMatch != 1 {
+		t.Errorf("summary: want total=2 created=1 no_match=1, got %+v", summary)
+	}
+	var audits []model.AuditPeerClassification
+	DB.Find(&audits)
+	if len(audits) != 1 {
+		t.Fatalf("want 1 audit row, got %d", len(audits))
+	}
+	if audits[0].Created != 1 || audits[0].NoMatch != 1 || audits[0].Total != 2 {
+		t.Errorf("audit counters: %+v", audits[0])
+	}
+	// The created AB entry: alias mirrors hostname, tag applied.
+	var ab model.AddressBook
+	DB.Where("user_id = ? AND id = ?", 1, "svr-a").First(&ab)
+	if ab.Alias != "svr-a" {
+		t.Errorf("alias mirror: want svr-a, got %q", ab.Alias)
+	}
+	if ab.CollectionId != 5 {
+		t.Errorf("collection: want 5, got %d", ab.CollectionId)
 	}
 }

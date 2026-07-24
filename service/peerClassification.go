@@ -280,3 +280,220 @@ func (s *PeerClassificationService) FindConflict(r *model.PeerClassificationRule
 	}
 	return nil
 }
+
+// ───────────────────────────── Plan / Apply ─────────────────────────────
+
+// Classification action verbs for a single peer.
+const (
+	PCActionCreate    = "create"    // peer not in AB, will be inserted into resolved collection
+	PCActionMove      = "move"      // existing AB entry changes collection
+	PCActionUpdate    = "update"    // existing AB entry, same collection, alias/tags change
+	PCActionUnchanged = "unchanged" // matched a collection but everything already correct
+	PCActionNone      = "none"      // no collection rule matched → peer left untouched
+)
+
+// PeerClassificationResult is the per-peer outcome shared by /simulate and /apply.
+type PeerClassificationResult struct {
+	PeerRowId            uint     `json:"peer_id"` // peers.row_id
+	PeerId               string   `json:"id"`      // peers.id (rustdesk id)
+	Hostname             string   `json:"hostname"`
+	CurrentCollectionId  *uint    `json:"current_collection_id"`
+	ProposedCollectionId *uint    `json:"proposed_collection_id"`
+	CurrentTags          []string `json:"current_tags"`
+	ProposedTags         []string `json:"proposed_tags"`
+	CurrentAlias         string   `json:"current_alias"`
+	ProposedAlias        string   `json:"proposed_alias"`
+	Action               string   `json:"action"`
+	Changes              bool     `json:"changes"`
+}
+
+// PlanSummary aggregates a plan/apply run.
+type PlanSummary struct {
+	Total     int `json:"total"`
+	Created   int `json:"created"`
+	Moved     int `json:"moved"`
+	Updated   int `json:"updated"`
+	Unchanged int `json:"unchanged"`
+	NoMatch   int `json:"no_match"`
+}
+
+// currentABEntry returns the (single) address-book entry that this system
+// manages for a peer, keyed by (user_id, peer_id); nil if the peer is not yet in
+// the address book. If the admin manually created the same peer in several
+// collections, only the first is considered (documented limitation).
+func currentABEntry(userId uint, peerId string) *model.AddressBook {
+	ab := &model.AddressBook{}
+	if err := DB.Where("user_id = ? AND id = ?", userId, peerId).First(ab).Error; err != nil {
+		return nil
+	}
+	return ab
+}
+
+func unionTags(current, add []string) []string {
+	out := make([]string, 0, len(current)+len(add))
+	seen := make(map[string]bool)
+	for _, t := range current {
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	for _, t := range add {
+		if t == "" || seen[t] {
+			continue
+		}
+		seen[t] = true
+		out = append(out, t)
+	}
+	return out
+}
+
+// BuildPlan computes, read-only, the classification plan for all of userId's
+// peers against their active rules. It performs NO writes. Evaluation runs
+// against peers.hostname (the live value), never address_books.hostname.
+func (s *PeerClassificationService) BuildPlan(userId uint) ([]PeerClassificationResult, PlanSummary) {
+	rules := s.ActiveRulesByUserId(userId)
+
+	var peers []*model.Peer
+	DB.Where("user_id = ?", userId).Order("row_id asc").Find(&peers)
+
+	results := make([]PeerClassificationResult, 0, len(peers))
+	summary := PlanSummary{Total: len(peers)}
+
+	for _, p := range peers {
+		outcome := s.Evaluate(p.Hostname, rules)
+		ab := currentABEntry(userId, p.Id)
+
+		res := PeerClassificationResult{
+			PeerRowId: p.RowId,
+			PeerId:    p.Id,
+			Hostname:  p.Hostname,
+		}
+		if ab != nil {
+			cid := ab.CollectionId
+			res.CurrentCollectionId = &cid
+			res.CurrentTags = DecodeTags(ab.Tags)
+			res.CurrentAlias = ab.Alias
+		}
+
+		if outcome.TargetCollectionId == nil {
+			// No collection rule matched → never touched (not even alias/tags).
+			res.Action = PCActionNone
+			res.ProposedCollectionId = res.CurrentCollectionId
+			res.ProposedTags = res.CurrentTags
+			res.ProposedAlias = res.CurrentAlias
+			summary.NoMatch++
+			results = append(results, res)
+			continue
+		}
+
+		res.ProposedCollectionId = outcome.TargetCollectionId
+		res.ProposedAlias = p.Hostname // alias mirrors the live hostname
+		res.ProposedTags = unionTags(res.CurrentTags, outcome.Tags)
+
+		switch {
+		case ab == nil:
+			res.Action = PCActionCreate
+			res.Changes = true
+			summary.Created++
+		case *res.CurrentCollectionId != *outcome.TargetCollectionId:
+			res.Action = PCActionMove
+			res.Changes = true
+			summary.Moved++
+		case res.CurrentAlias != p.Hostname || len(res.ProposedTags) != len(res.CurrentTags):
+			res.Action = PCActionUpdate
+			res.Changes = true
+			summary.Updated++
+		default:
+			res.Action = PCActionUnchanged
+			summary.Unchanged++
+		}
+		results = append(results, res)
+	}
+	return results, summary
+}
+
+// pcWriteOne persists a single planned change within a transaction. It is a
+// package variable so tests can inject a fault to verify full rollback (there is
+// no natural constraint to violate mid-batch on SQLite). Production always uses
+// pcWriteOneDefault.
+var pcWriteOne = pcWriteOneDefault
+
+func pcWriteOneDefault(tx *gorm.DB, userId uint, r *PeerClassificationResult, peer *model.Peer) error {
+	switch r.Action {
+	case PCActionCreate:
+		ab := &model.AddressBook{
+			Id:           peer.Id,
+			Username:     peer.Username,
+			Hostname:     peer.Hostname,
+			Alias:        peer.Hostname, // mirror, always
+			Platform:     AllService.AddressBookService.PlatformFromOs(peer.Os),
+			UserId:       userId,
+			CollectionId: *r.ProposedCollectionId,
+			Tags:         EncodeTags(r.ProposedTags),
+		}
+		return tx.Create(ab).Error
+	case PCActionMove, PCActionUpdate:
+		return tx.Model(&model.AddressBook{}).
+			Where("user_id = ? AND id = ?", userId, peer.Id).
+			Updates(map[string]interface{}{
+				"collection_id": *r.ProposedCollectionId,
+				"alias":         peer.Hostname,
+				"tags":          EncodeTags(r.ProposedTags),
+			}).Error
+	default:
+		return nil
+	}
+}
+
+// Apply computes the plan and executes every change inside a single transaction
+// (all-or-nothing). On any write error the whole batch rolls back and the error
+// is returned with no partial changes. adminId is the executing user; userId is
+// whose peers are classified (equal in the current /me-scoped controller). An
+// audit row is written best-effort after a successful commit.
+func (s *PeerClassificationService) Apply(userId, adminId uint) ([]PeerClassificationResult, PlanSummary, error) {
+	results, summary := s.BuildPlan(userId)
+
+	// Index peers by rustdesk id for the writer (need Username/Os on create).
+	var peers []*model.Peer
+	DB.Where("user_id = ?", userId).Find(&peers)
+	peerById := make(map[string]*model.Peer, len(peers))
+	for _, p := range peers {
+		peerById[p.Id] = p
+	}
+
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		for i := range results {
+			r := &results[i]
+			if !r.Changes {
+				continue
+			}
+			if err := pcWriteOne(tx, userId, r, peerById[r.PeerId]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, PlanSummary{}, err
+	}
+
+	// Audit (best-effort; never blocks the response).
+	_ = s.CreateApplyAudit(&model.AuditPeerClassification{
+		AdminId: adminId,
+		UserId:  userId,
+		Total:   summary.Total,
+		Created: summary.Created,
+		Moved:   summary.Moved,
+		Updated: summary.Updated,
+		NoMatch: summary.NoMatch,
+	})
+
+	return results, summary, nil
+}
+
+// CreateApplyAudit persists one audit row for an apply run.
+func (s *PeerClassificationService) CreateApplyAudit(a *model.AuditPeerClassification) error {
+	return DB.Create(a).Error
+}

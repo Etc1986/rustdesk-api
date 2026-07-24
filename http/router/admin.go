@@ -37,6 +37,7 @@ func Init(g *gin.Engine) {
 	AuditBind(adg)
 	AddressBookCollectionBind(adg)
 	AddressBookCollectionRuleBind(adg)
+	PeerClassificationBind(adg)
 	UserTokenBind(adg)
 
 	//deprecated by ConfigBind
@@ -223,6 +224,22 @@ func AddressBookCollectionRuleBind(rg *gin.RouterGroup) {
 		aR.POST("/create", cont.Create)
 		aR.POST("/update", cont.Update)
 		aR.POST("/delete", cont.Delete)
+	}
+}
+
+// PeerClassificationBind registers the peer-classification rule engine. Every
+// route is user-scoped (the controller forces the current user), so plain
+// BackendUserAuth (already applied on the parent group) is sufficient.
+func PeerClassificationBind(rg *gin.RouterGroup) {
+	pc := rg.Group("/peer_classification")
+	{
+		cont := &admin.PeerClassificationRule{}
+		pc.GET("/rule/list", cont.List)
+		pc.POST("/rule/create", cont.Create)
+		pc.POST("/rule/update", cont.Update)
+		pc.POST("/rule/delete", cont.Delete)
+		pc.POST("/simulate", cont.Simulate)
+		pc.POST("/apply", cont.Apply)
 	}
 }
 func UserTokenBind(rg *gin.RouterGroup) {
