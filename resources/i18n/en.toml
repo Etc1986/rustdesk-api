@@ -158,3 +158,7 @@ other = "Banned."
 description = "Register success, wait admin confirm."
 one = "Register success, wait admin confirm."
 other = "Register success, wait admin confirm."
+
+[PeerClassificationRuleConflict]
+description = "Another rule with the same priority already routes overlapping hostnames to a different collection."
+one = "Another rule with the same priority already routes overlapping hostnames to a different collection. Use a different priority to disambiguate."

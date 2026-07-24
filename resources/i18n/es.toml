@@ -167,3 +167,7 @@ other = "Prohibido."
 description = "Register success, wait admin confirm."
 one = "Registro exitoso, espere la confirmación del administrador."
 other = "Registro exitoso, espere la confirmación del administrador."
+
+[PeerClassificationRuleConflict]
+description = "Another rule with the same priority already routes overlapping hostnames to a different collection."
+one = "Otra regla con la misma prioridad ya enruta hostnames solapados a una colección distinta. Usa una prioridad diferente para desambiguar."
