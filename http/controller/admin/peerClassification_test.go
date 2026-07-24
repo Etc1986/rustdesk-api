@@ -632,6 +632,48 @@ func TestUndo_SkipsManuallyModified(t *testing.T) {
 	}
 }
 
+// Test: an entry whose TAGS were edited after apply → undo skips and reports it.
+// (Companion to TestUndo_SkipsManuallyModified, which covers the alias field.
+// Together they confirm modification detection across collection/alias/tags,
+// since entryMatchesApplied compares all three.)
+func TestUndo_SkipsManuallyModified_Tags(t *testing.T) {
+	db := setupPCHandlerDB(t)
+	seedRuleTags(db, 1, model.MatcherTypeContains, "suc47", 47, []string{"site"}, 10)
+	db.Create(&model.Peer{Id: "m2", Hostname: "svr-suc47", UserId: 0, Os: "Windows"})
+	db.Create(&model.AddressBook{Id: "m2", UserId: 1, CollectionId: 3, Alias: "svr-suc47", Tags: service.EncodeTags([]string{"orig"})})
+	router := pcRouter(makeUser(1))
+
+	pcPost(t, router, "/apply") // moves m2 to 47, tags become [orig, site]
+
+	// A human edits the tags after the apply (adds one).
+	db.Model(&model.AddressBook{}).Where("user_id = ? AND id = ?", 1, "m2").
+		Update("tags", service.EncodeTags([]string{"orig", "site", "human-added"}))
+
+	resp := pcPost(t, router, "/undo")
+	if respCode(resp) != 0 {
+		t.Fatalf("undo failed: %v", resp)
+	}
+	if dataInt(resp, "skipped_modified") != 1 || dataInt(resp, "restored") != 0 {
+		t.Errorf("tags-modified entry: want skipped_modified=1 restored=0, got %v", resp["data"])
+	}
+	// Not reverted: collection stays 47 and the human's tag survives.
+	var ab model.AddressBook
+	db.Where("user_id = ? AND id = ?", 1, "m2").First(&ab)
+	if ab.CollectionId != 47 {
+		t.Errorf("modified entry must not be reverted, collection=%d", ab.CollectionId)
+	}
+	tags := service.DecodeTags(ab.Tags)
+	has := false
+	for _, tg := range tags {
+		if tg == "human-added" {
+			has = true
+		}
+	}
+	if !has {
+		t.Errorf("human tag edit must be preserved, got %v", tags)
+	}
+}
+
 // Test: an entry pinned after apply → undo doesn't touch it.
 func TestUndo_SkipsPinnedAfterApply(t *testing.T) {
 	db := setupPCHandlerDB(t)
