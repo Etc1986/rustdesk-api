@@ -560,6 +560,20 @@ func (s *PeerClassificationService) Apply(userId, adminId uint) ([]PeerClassific
 				return err
 			}
 		}
+
+		// Retention: only the latest apply run is reversible, so the per-entry
+		// snapshot of this user's PREVIOUS apply runs is no longer useful. Purge
+		// that detail while keeping the summary audit rows for history.
+		var priorRunIds []uint
+		tx.Model(&model.AuditPeerClassification{}).
+			Where("user_id = ? AND kind = ? AND id <> ?", userId, model.AuditPCKindApply, audit.Id).
+			Pluck("id", &priorRunIds)
+		if len(priorRunIds) > 0 {
+			if err := tx.Where("audit_id IN ?", priorRunIds).
+				Delete(&model.AuditPeerClassificationItem{}).Error; err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {

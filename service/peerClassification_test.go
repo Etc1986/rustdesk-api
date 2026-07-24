@@ -510,3 +510,71 @@ func TestUndo_RollbackOnMidFailure(t *testing.T) {
 		t.Errorf("no undo event should be written on rollback, got %d", undoCount)
 	}
 }
+
+// TestApply_PurgesPreviousSnapshotDetail verifies retention: after a second
+// apply, only the latest run keeps its per-entry snapshot; the previous run
+// keeps its summary counters but its detail rows are purged.
+func TestApply_PurgesPreviousSnapshotDetail(t *testing.T) {
+	setupPCTestDB(t)
+	svc := &PeerClassificationService{}
+
+	rule := &model.PeerClassificationRule{
+		UserId: 1, MatcherType: model.MatcherTypePrefix, Pattern: "svr-",
+		TargetCollectionId: uptr(5), TargetTags: EncodeTags(nil), Priority: 10, Active: true,
+	}
+	if err := svc.CreateRule(rule); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+
+	// Apply #1: creates svr-1 (run A, 1 snapshot item).
+	DB.Create(&model.Peer{Id: "svr-1", Hostname: "svr-1", UserId: 0, Os: "Windows"})
+	if _, _, err := svc.Apply(1, 1); err != nil {
+		t.Fatalf("apply#1: %v", err)
+	}
+	var runA model.AuditPeerClassification
+	DB.Where("kind = ?", model.AuditPCKindApply).Order("id asc").First(&runA)
+
+	var itemsA int64
+	DB.Model(&model.AuditPeerClassificationItem{}).Where("audit_id = ?", runA.Id).Count(&itemsA)
+	if itemsA != 1 {
+		t.Fatalf("run A should have 1 snapshot item after apply#1, got %d", itemsA)
+	}
+
+	// Apply #2: creates svr-2 (run B). Should purge run A's detail.
+	DB.Create(&model.Peer{Id: "svr-2", Hostname: "svr-2", UserId: 0, Os: "Windows"})
+	if _, _, err := svc.Apply(1, 1); err != nil {
+		t.Fatalf("apply#2: %v", err)
+	}
+	var runB model.AuditPeerClassification
+	DB.Where("kind = ?", model.AuditPCKindApply).Order("id desc").First(&runB)
+	if runB.Id == runA.Id {
+		t.Fatal("expected a distinct second run")
+	}
+
+	// Run A: summary counters intact, but NO detail rows.
+	var reloadedA model.AuditPeerClassification
+	DB.First(&reloadedA, runA.Id)
+	if reloadedA.Id == 0 {
+		t.Fatal("run A audit summary must be kept for history")
+	}
+	if reloadedA.Created != 1 {
+		t.Errorf("run A must keep its counters (created=1), got %d", reloadedA.Created)
+	}
+	DB.Model(&model.AuditPeerClassificationItem{}).Where("audit_id = ?", runA.Id).Count(&itemsA)
+	if itemsA != 0 {
+		t.Errorf("run A detail must be purged after a newer apply, got %d items", itemsA)
+	}
+
+	// Run B: detail present (svr-2 created).
+	var itemsB int64
+	DB.Model(&model.AuditPeerClassificationItem{}).Where("audit_id = ?", runB.Id).Count(&itemsB)
+	if itemsB != 1 {
+		t.Errorf("run B should keep its snapshot (1 item), got %d", itemsB)
+	}
+	// Total detail rows across all runs = only run B's.
+	var totalItems int64
+	DB.Model(&model.AuditPeerClassificationItem{}).Count(&totalItems)
+	if totalItems != 1 {
+		t.Errorf("only the latest run's detail should remain, got %d total items", totalItems)
+	}
+}
