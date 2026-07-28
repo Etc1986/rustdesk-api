@@ -116,8 +116,15 @@ func (ct *AddressBook) Create(c *gin.Context) {
 // @Router /admin/my/address_book/update [post]
 // @Security token
 func (ct *AddressBook) Update(c *gin.Context) {
-	f := &admin.AddressBookForm{}
-	if err := c.ShouldBindJSON(f); err != nil {
+	raw, err := c.GetRawData()
+	if err != nil {
+		response.Fail(c, 101, response.TranslateMsg(c, "ParamsError")+err.Error())
+		return
+	}
+	// Bind the form AND the set of columns the request actually addresses, so
+	// fields the caller omitted keep their stored value instead of being reset.
+	f, columns, err := admin.BindAddressBookUpdate(raw)
+	if err != nil {
 		response.Fail(c, 101, response.TranslateMsg(c, "ParamsError")+err.Error())
 		return
 	}
@@ -150,8 +157,7 @@ func (ct *AddressBook) Update(c *gin.Context) {
 		response.Fail(c, 101, response.TranslateMsg(c, "ParamsError"))
 		return
 	}
-	err := service.AllService.AddressBookService.UpdateAll(t)
-	if err != nil {
+	if err := service.AllService.AddressBookService.UpdateFields(t, columns); err != nil {
 		response.Fail(c, 101, response.TranslateMsg(c, "OperationFailed")+err.Error())
 		return
 	}

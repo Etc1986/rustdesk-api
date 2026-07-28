@@ -230,11 +230,25 @@ func (s *AddressBookService) UpdateByMap(u *model.AddressBook, data map[string]i
 	return DB.Model(u).Updates(data).Error
 }
 
-// UpdateAll 更新
-// Omits "pinned": that flag is owned exclusively by the classification pin
-// endpoint, so a regular admin edit (which doesn't carry it) must never reset it.
-func (s *AddressBookService) UpdateAll(u *model.AddressBook) error {
-	return DB.Model(u).Select("*").Omit("created_at", "pinned").Updates(u).Error
+// UpdateFields updates exactly the given columns of the entry identified by
+// u.RowId, taking the values from u. Columns not listed keep whatever they hold
+// in the database.
+//
+// This replaces the previous UpdateAll, which wrote with Select("*") and an
+// Omit() blocklist. That form derived the write-set from the model, so every
+// column the caller had not sent was silently reset to its zero value, and each
+// newly added field inherited the problem — `pinned` was patched that way, and
+// `password` was next in line. Here the caller passes the columns its request
+// actually addressed (see admin.BindAddressBookUpdate), so omission means
+// "leave alone" instead of "erase".
+//
+// An empty column set is a no-op rather than an error: a request that addresses
+// nothing writable should change nothing, not fail.
+func (s *AddressBookService) UpdateFields(u *model.AddressBook, columns []string) error {
+	if len(columns) == 0 {
+		return nil
+	}
+	return DB.Model(u).Select(columns).Updates(u).Error
 }
 
 // ShareByWebClient 分享

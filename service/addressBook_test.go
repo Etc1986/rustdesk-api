@@ -325,9 +325,9 @@ func TestScale_2Peers(t *testing.T)   { runScaleBatch(t, 2) }
 func TestScale_10Peers(t *testing.T)  { runScaleBatch(t, 10) }
 func TestScale_100Peers(t *testing.T) { runScaleBatch(t, 100) }
 
-// TestUpdateAll_PreservesPinned ensures a regular admin edit (which does not
+// TestUpdateFields_PreservesPinned ensures a regular admin edit (which does not
 // carry the pinned flag) never clears an entry's pin.
-func TestUpdateAll_PreservesPinned(t *testing.T) {
+func TestUpdateFields_PreservesPinned(t *testing.T) {
 	db := setupABTestDB(t)
 	svc := &AddressBookService{}
 
@@ -335,12 +335,12 @@ func TestUpdateAll_PreservesPinned(t *testing.T) {
 	ab := &model.AddressBook{Id: "px", UserId: 1, CollectionId: 3, Pinned: true, Alias: "old", Tags: tagBytes()}
 	db.Create(ab)
 
-	// Simulate an admin edit: a form-built struct WITHOUT pinned (false), changing
-	// the alias, run through UpdateAll (Select("*")).
+	// Simulate an admin edit: a form-built struct WITHOUT pinned (false),
+	// addressing only the alias column.
 	edit := &model.AddressBook{Alias: "new", Id: "px", UserId: 1, CollectionId: 3, Tags: tagBytes()}
 	edit.RowId = ab.RowId
-	if err := svc.UpdateAll(edit); err != nil {
-		t.Fatalf("UpdateAll: %v", err)
+	if err := svc.UpdateFields(edit, []string{"alias"}); err != nil {
+		t.Fatalf("UpdateFields: %v", err)
 	}
 
 	var reloaded model.AddressBook
@@ -350,5 +350,90 @@ func TestUpdateAll_PreservesPinned(t *testing.T) {
 	}
 	if !reloaded.Pinned {
 		t.Error("pinned must survive an admin edit that omits it")
+	}
+}
+
+// TestUpdateFields_LeavesUnlistedColumnsAlone is the general regression guard
+// for the Select("*") bug: an edit that addresses one column must not disturb
+// any other, whatever the edit struct happens to carry in its zero-valued
+// fields. Password and hash are the ones that actually hurt — both are peer
+// credentials, and silently blanking them breaks connections rather than
+// merely losing display text.
+func TestUpdateFields_LeavesUnlistedColumnsAlone(t *testing.T) {
+	db := setupABTestDB(t)
+	svc := &AddressBookService{}
+
+	ab := &model.AddressBook{
+		Id: "px", UserId: 1, CollectionId: 3,
+		Alias: "old-alias", Username: "operator", Hostname: "PC-01",
+		Platform: "Windows", Password: "peer-pw", Hash: "peer-hash",
+		RdpPort: "3389", RdpUsername: "rdpuser", LoginName: "login",
+		Pinned: true, ForceAlwaysRelay: true, SameServer: true,
+		Tags: tagBytes(),
+	}
+	db.Create(ab)
+
+	// The edit struct is deliberately near-empty: it mimics a client that sent
+	// only {"row_id":N,"alias":"new-alias"}. Under Select("*") every other
+	// column would be overwritten with these zero values.
+	edit := &model.AddressBook{Alias: "new-alias"}
+	edit.RowId = ab.RowId
+	if err := svc.UpdateFields(edit, []string{"alias"}); err != nil {
+		t.Fatalf("UpdateFields: %v", err)
+	}
+
+	var got model.AddressBook
+	db.Where("row_id = ?", ab.RowId).First(&got)
+
+	if got.Alias != "new-alias" {
+		t.Errorf("alias should have been written: got %q", got.Alias)
+	}
+	checks := []struct {
+		column string
+		want   interface{}
+		got    interface{}
+	}{
+		{"password", "peer-pw", got.Password},
+		{"hash", "peer-hash", got.Hash},
+		{"id", "px", got.Id},
+		{"username", "operator", got.Username},
+		{"hostname", "PC-01", got.Hostname},
+		{"platform", "Windows", got.Platform},
+		{"rdp_port", "3389", got.RdpPort},
+		{"rdp_username", "rdpuser", got.RdpUsername},
+		{"login_name", "login", got.LoginName},
+		{"user_id", uint(1), got.UserId},
+		{"collection_id", uint(3), got.CollectionId},
+		{"pinned", true, got.Pinned},
+		{"force_always_relay", true, got.ForceAlwaysRelay},
+		{"same_server", true, got.SameServer},
+	}
+	for _, ck := range checks {
+		if ck.got != ck.want {
+			t.Errorf("column %q was clobbered by an edit that did not address it: want %v, got %v",
+				ck.column, ck.want, ck.got)
+		}
+	}
+}
+
+// TestUpdateFields_EmptyColumnSetIsNoop verifies a request that addresses no
+// writable column changes nothing and reports no error.
+func TestUpdateFields_EmptyColumnSetIsNoop(t *testing.T) {
+	db := setupABTestDB(t)
+	svc := &AddressBookService{}
+
+	ab := &model.AddressBook{Id: "px", UserId: 1, Alias: "keep", Password: "peer-pw", Tags: tagBytes()}
+	db.Create(ab)
+
+	edit := &model.AddressBook{Alias: "should-not-apply"}
+	edit.RowId = ab.RowId
+	if err := svc.UpdateFields(edit, nil); err != nil {
+		t.Fatalf("empty column set should be a no-op, got error: %v", err)
+	}
+
+	var got model.AddressBook
+	db.Where("row_id = ?", ab.RowId).First(&got)
+	if got.Alias != "keep" || got.Password != "peer-pw" {
+		t.Errorf("no-op update wrote anyway: alias=%q password=%q", got.Alias, got.Password)
 	}
 }

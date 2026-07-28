@@ -2,6 +2,8 @@ package admin
 
 import (
 	"encoding/json"
+	"sort"
+
 	"github.com/lejianwen/rustdesk-api/v2/model"
 )
 
@@ -78,6 +80,75 @@ func (a AddressBookForm) ToAddressBooks() []*model.AddressBook {
 		})
 	}
 	return abs
+}
+
+// adminEditableColumns maps a request-body JSON key to the address_books column
+// an administrative edit is allowed to write through it.
+//
+// This is an ALLOWLIST, and the inversion is the whole point. The previous
+// implementation wrote with Select("*") plus an Omit() blocklist, which made
+// the write-set a function of the MODEL instead of the REQUEST: every column
+// the caller did not send was overwritten with its zero value. Auditing that
+// field-by-field is misleading, because at struct level the admin form covers
+// everything except `pinned` — so the earlier Omit("pinned") fix looked
+// complete. It was not. A form field existing in Go says nothing about whether
+// the client sent it: an absent JSON key decodes to the zero value, which is
+// indistinguishable from "set this to empty". Every column was exposed, and
+// each new one inherited the hazard.
+//
+// Deriving the write-set from the keys actually present in the body fixes the
+// whole class at once, and makes any column added to model.AddressBook in the
+// future read-only for admin edits until it is listed here on purpose.
+//
+// Deliberately absent: row_id (the key being edited, never a payload), pinned
+// (owned exclusively by the classification pin endpoint), created_at and
+// updated_at (owned by GORM).
+var adminEditableColumns = map[string]string{
+	"id":               "id",
+	"username":         "username",
+	"password":         "password",
+	"hostname":         "hostname",
+	"alias":            "alias",
+	"platform":         "platform",
+	"tags":             "tags",
+	"hash":             "hash",
+	"user_id":          "user_id",
+	"forceAlwaysRelay": "force_always_relay",
+	"rdpPort":          "rdp_port",
+	"rdpUsername":      "rdp_username",
+	"online":           "online",
+	"loginName":        "login_name",
+	"sameServer":       "same_server",
+	"collection_id":    "collection_id",
+}
+
+// BindAddressBookUpdate decodes an administrative address-book edit from the
+// raw request body, returning both the typed form and the exact set of columns
+// the request addresses.
+//
+// The body is decoded twice on purpose: once into the form, for correctly typed
+// values, and once into a key set, to learn what the caller actually sent.
+// Columns the caller omitted are left out of the write-set entirely and keep
+// their stored value. Unknown keys are ignored rather than rejected, matching
+// how the endpoint behaved before.
+func BindAddressBookUpdate(raw []byte) (*AddressBookForm, []string, error) {
+	f := &AddressBookForm{}
+	if err := json.Unmarshal(raw, f); err != nil {
+		return nil, nil, err
+	}
+	var present map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &present); err != nil {
+		return nil, nil, err
+	}
+	cols := make([]string, 0, len(present))
+	for key := range present {
+		if col, ok := adminEditableColumns[key]; ok {
+			cols = append(cols, col)
+		}
+	}
+	// Deterministic order keeps generated SQL and test assertions stable.
+	sort.Strings(cols)
+	return f, cols, nil
 }
 
 type AddressBookQuery struct {
