@@ -133,3 +133,23 @@ type BatchUpdateTagsForm struct {
 	RowIds []uint   `json:"row_ids"`
 	Tags   []string `json:"tags"`
 }
+
+// BatchSetPasswordForm assigns one peer password to many address-book entries.
+//
+// The target set is addressed EITHER by explicit row ids OR by collection —
+// exactly one of the two, never both and never neither, so the request can
+// never be ambiguous about what it is about to overwrite.
+//
+// UserId is an optional scope guard, not the target selector. When present,
+// every entry outside that user is refused (reported as "forbidden") instead of
+// being written. It is optional because the same physical machine legitimately
+// appears in several users' address books, and its password is a property of
+// the machine, not of the user — refusing cross-user batches outright would
+// defeat the point of assigning at scale. Callers that DO want a single-user
+// batch can pin it by sending user_id.
+type BatchSetPasswordForm struct {
+	RowIds       []uint `json:"row_ids"`
+	CollectionId uint   `json:"collection_id"`
+	UserId       uint   `json:"user_id"`
+	Password     string `json:"password" validate:"required"`
+}

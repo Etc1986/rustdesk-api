@@ -45,6 +45,28 @@ type AuditFileList struct {
 	Pagination
 }
 
+// AuditAbPassword records one administrative "batch set address-book password"
+// operation: who ran it, when, over how many entries, and against which
+// collection. One row per invocation of BatchSetPassword.
+//
+// The password itself is deliberately absent, and must stay absent. The whole
+// point of the audit trail is that it can be read, exported and retained
+// widely; a peer password stored here would be a durable plaintext copy of a
+// credential in a table with a much broader audience than address_books. The
+// counters answer "what happened" without answering "what was set".
+type AuditAbPassword struct {
+	IdModel
+	AdminId      uint `json:"admin_id" gorm:"default:0;not null;index"`
+	UserId       uint `json:"user_id" gorm:"default:0;not null;index"`
+	CollectionId uint `json:"collection_id" gorm:"default:0;not null"`
+	Total        int  `json:"total" gorm:"default:0;not null"`
+	Updated      int  `json:"updated" gorm:"default:0;not null"`
+	Skipped      int  `json:"skipped" gorm:"default:0;not null"`
+	NotFound     int  `json:"not_found" gorm:"default:0;not null"`
+	Failed       int  `json:"failed" gorm:"default:0;not null"`
+	TimeModel
+}
+
 // AuditAbBatch records one administrative "batch-add-to-address-book" operation.
 // One row per invocation of BatchCreateFromPeers; counters summarise the outcome.
 type AuditAbBatch struct {

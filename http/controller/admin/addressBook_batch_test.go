@@ -42,6 +42,10 @@ func TestMain(m *testing.M) {
 		return i18n.NewLocalizer(bundle, "en")
 	}
 
+	// Handlers that call global.Validator.ValidStruct need it wired, otherwise
+	// the func field is nil and the handler panics instead of validating.
+	global.ApiInitValidator()
+
 	os.Exit(m.Run())
 }
 
@@ -60,6 +64,7 @@ func setupHandlerDB(t *testing.T) *gorm.DB {
 		&model.AddressBookCollection{},
 		&model.Peer{},
 		&model.AuditAbBatch{},
+		&model.AuditAbPassword{},
 		&model.User{},
 	); err != nil {
 		t.Fatalf("automigrate: %v", err)

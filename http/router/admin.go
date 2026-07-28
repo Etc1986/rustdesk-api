@@ -145,6 +145,7 @@ func AddressBookBind(rg *gin.RouterGroup) {
 		arp.POST("/delete", cont.Delete)
 		arp.POST("/batchCreate", cont.BatchCreate)
 		arp.POST("/batchCreateFromPeers", cont.BatchCreateFromPeers)
+		arp.POST("/batchSetPassword", cont.BatchSetPassword)
 
 	}
 }

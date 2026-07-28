@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"github.com/google/uuid"
 	"github.com/lejianwen/rustdesk-api/v2/model"
 	"gorm.io/gorm"
@@ -154,6 +155,60 @@ func (s *AddressBookService) CreateBatch(abs []*model.AddressBook) error {
 // CreateBatchAudit persists a single audit record for a batch operation.
 func (s *AddressBookService) CreateBatchAudit(a *model.AuditAbBatch) error {
 	return DB.Create(a).Error
+}
+
+// CreatePasswordAudit persists a single audit record for a batch password
+// assignment. See model.AuditAbPassword: the record never carries the password.
+func (s *AddressBookService) CreatePasswordAudit(a *model.AuditAbPassword) error {
+	return DB.Create(a).Error
+}
+
+// FindByRowIds loads address-book entries by their integer primary keys in a
+// single query. Missing ids are simply absent from the result — the caller is
+// responsible for reporting them.
+func (s *AddressBookService) FindByRowIds(ids []uint) []*model.AddressBook {
+	var abs []*model.AddressBook
+	if len(ids) == 0 {
+		return abs
+	}
+	DB.Where("row_id in ?", ids).Find(&abs)
+	return abs
+}
+
+// FindByCollectionId loads every address-book entry filed under a collection.
+func (s *AddressBookService) FindByCollectionId(cid uint) []*model.AddressBook {
+	var abs []*model.AddressBook
+	DB.Where("collection_id = ?", cid).Find(&abs)
+	return abs
+}
+
+// BatchSetPassword writes the same password to every listed entry inside one
+// transaction. All-or-nothing: the first write error rolls the whole set back,
+// so a partial assignment can never be committed.
+//
+// It updates the single "password" column rather than saving the struct, so it
+// cannot disturb any other field of the entries it touches.
+func (s *AddressBookService) BatchSetPassword(rowIds []uint, password string) error {
+	if len(rowIds) == 0 {
+		return nil
+	}
+	tx := DB.Begin()
+	if tx.Error != nil {
+		return tx.Error
+	}
+	for _, id := range rowIds {
+		res := tx.Model(&model.AddressBook{}).Where("row_id = ?", id).
+			Update("password", password)
+		if res.Error != nil {
+			tx.Rollback()
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			tx.Rollback()
+			return fmt.Errorf("address book entry %d vanished mid-transaction", id)
+		}
+	}
+	return tx.Commit().Error
 }
 
 // Create 创建

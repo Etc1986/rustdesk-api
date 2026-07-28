@@ -423,3 +423,155 @@ func (ct *AddressBook) BatchCreateFromPeers(c *gin.Context) {
 		"results":   results,
 	})
 }
+
+// BatchSetPassword 批量设置密码
+// @Tags 地址簿
+// @Summary 批量设置地址簿密码
+// @Description 批量设置地址簿密码
+// @Accept json
+// @Produce json
+// @Param body body admin.BatchSetPasswordForm true "批量设置密码"
+// @Success 200 {object} response.Response
+// @Failure 500 {object} response.Response
+// @Router /admin/address_book/batchSetPassword [post]
+// @Security token
+func (ct *AddressBook) BatchSetPassword(c *gin.Context) {
+	f := &admin.BatchSetPasswordForm{}
+	if err := c.ShouldBindJSON(f); err != nil {
+		response.Fail(c, 101, response.TranslateMsg(c, "ParamsError")+err.Error())
+		return
+	}
+	if errList := global.Validator.ValidStruct(c, f); len(errList) > 0 {
+		response.Fail(c, 101, errList[0])
+		return
+	}
+	if f.Password == "" {
+		response.Fail(c, 101, response.TranslateMsg(c, "ParamsError"))
+		return
+	}
+
+	// The target set is addressed by row ids XOR by collection. Accepting both
+	// would leave it undefined which one wins on a bulk credential write, and
+	// accepting neither would silently target nothing.
+	byRows, byCollection := len(f.RowIds) > 0, f.CollectionId != 0
+	if byRows == byCollection {
+		response.Fail(c, 101, response.TranslateMsg(c, "ParamsError"))
+		return
+	}
+
+	// Phase 1 — Resolve the target set (read-only, no DB writes).
+	type EntryResult struct {
+		RowId  uint   `json:"row_id"`
+		Status string `json:"status"` // updated | unchanged | forbidden | not_found | failed
+	}
+	results := make([]EntryResult, 0)
+	pendingIds := make([]uint, 0)
+	pendingIdxs := make([]int, 0)
+	skippedCount, notFoundCount := 0, 0
+	auditUserId, auditCollectionId := f.UserId, f.CollectionId
+
+	// classify decides the fate of one resolved entry, shared by both modes.
+	classify := func(ab *model.AddressBook) {
+		idx := len(results)
+		switch {
+		case f.UserId != 0 && ab.UserId != f.UserId:
+			// Scope guard was supplied and this entry falls outside it.
+			results = append(results, EntryResult{RowId: ab.RowId, Status: "forbidden"})
+			skippedCount++
+		case ab.Password == f.Password:
+			// Already correct — writing it again would only churn updated_at.
+			results = append(results, EntryResult{RowId: ab.RowId, Status: "unchanged"})
+			skippedCount++
+		default:
+			results = append(results, EntryResult{RowId: ab.RowId, Status: "pending"})
+			pendingIdxs = append(pendingIdxs, idx)
+			pendingIds = append(pendingIds, ab.RowId)
+		}
+	}
+
+	if byCollection {
+		// Ownership: the collection must exist, and — when a scope guard was
+		// supplied — belong to that user. CheckCollectionOwner is intentionally
+		// opaque: it answers false both for "missing" and "someone else's".
+		collection := service.AllService.AddressBookService.CollectionInfoById(f.CollectionId)
+		if collection.Id == 0 {
+			response.Fail(c, 101, response.TranslateMsg(c, "NoAccess"))
+			return
+		}
+		if f.UserId != 0 && !service.AllService.AddressBookService.CheckCollectionOwner(f.UserId, f.CollectionId) {
+			response.Fail(c, 101, response.TranslateMsg(c, "NoAccess"))
+			return
+		}
+		// With no explicit guard, the collection's owner is the audited subject.
+		if auditUserId == 0 {
+			auditUserId = collection.UserId
+		}
+		for _, ab := range service.AllService.AddressBookService.FindByCollectionId(f.CollectionId) {
+			classify(ab)
+		}
+	} else {
+		found := service.AllService.AddressBookService.FindByRowIds(f.RowIds)
+		byId := make(map[uint]*model.AddressBook, len(found))
+		for _, ab := range found {
+			byId[ab.RowId] = ab
+		}
+		// Iterate the request order, not the query order, so results[] lines up
+		// with what the caller sent and missing ids are reported rather than
+		// dropped.
+		for _, rid := range f.RowIds {
+			ab, ok := byId[rid]
+			if !ok {
+				results = append(results, EntryResult{RowId: rid, Status: "not_found"})
+				notFoundCount++
+				continue
+			}
+			classify(ab)
+		}
+	}
+
+	// Phase 2 — Transactional write (all-or-nothing for the pending set).
+	updatedCount, failedCount := 0, 0
+	if len(pendingIds) > 0 {
+		if err := service.AllService.AddressBookService.BatchSetPassword(pendingIds, f.Password); err != nil {
+			failedCount = len(pendingIds)
+			for _, idx := range pendingIdxs {
+				results[idx].Status = "failed"
+			}
+		} else {
+			updatedCount = len(pendingIds)
+			for _, idx := range pendingIdxs {
+				results[idx].Status = "updated"
+			}
+		}
+	}
+
+	// Phase 3 — Audit (best-effort; never blocks the response, never records
+	// the password itself — see model.AuditAbPassword).
+	// CurUser returns nil when the context carries no user. AdminPrivilege
+	// makes that unreachable in production, but the write has already been
+	// committed by this point: a nil deref here would turn a successful
+	// assignment into a 500 and strand the caller with no idea it went through.
+	adminId := uint(0)
+	if adminUser := service.AllService.UserService.CurUser(c); adminUser != nil {
+		adminId = adminUser.Id
+	}
+	_ = service.AllService.AddressBookService.CreatePasswordAudit(&model.AuditAbPassword{
+		AdminId:      adminId,
+		UserId:       auditUserId,
+		CollectionId: auditCollectionId,
+		Total:        len(results),
+		Updated:      updatedCount,
+		Skipped:      skippedCount,
+		NotFound:     notFoundCount,
+		Failed:       failedCount,
+	})
+
+	response.Success(c, gin.H{
+		"total":     len(results),
+		"updated":   updatedCount,
+		"skipped":   skippedCount,
+		"not_found": notFoundCount,
+		"failed":    failedCount,
+		"results":   results,
+	})
+}
