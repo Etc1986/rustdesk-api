@@ -228,11 +228,20 @@ func AddressBookCollectionRuleBind(rg *gin.RouterGroup) {
 	}
 }
 
-// PeerClassificationBind registers the peer-classification rule engine. Every
-// route is user-scoped (the controller forces the current user), so plain
-// BackendUserAuth (already applied on the parent group) is sufficient.
+// PeerClassificationBind registers the peer-classification rule engine.
+//
+// The whole group requires AdminPrivilege. Rules, collections and address-book
+// entries are scoped to the current user, but the PEERS are not: since bbf9f8c
+// BuildPlan/Apply evaluate every row of `peers`, because Lejianwen leaves
+// peers.user_id at 0 and there is no per-user device ownership to filter by.
+// With only BackendUserAuth, any logged-in non-admin user could call /simulate
+// (even with zero rules) and receive every device's rustdesk id and hostname,
+// or /apply a broad rule and copy the whole fleet into their own address book.
+// The web UI already places this screen among the admin pages; this makes the
+// server enforce it. Pin's "own entry" branch becomes admin-only as a result —
+// the UI only calls it from admin views.
 func PeerClassificationBind(rg *gin.RouterGroup) {
-	pc := rg.Group("/peer_classification")
+	pc := rg.Group("/peer_classification").Use(middleware.AdminPrivilege())
 	{
 		cont := &admin.PeerClassificationRule{}
 		pc.GET("/rule/list", cont.List)
